@@ -1,12 +1,15 @@
 # Reads and parses .rsp files and runs them through testcrypto
 #
-# Test vectors downloaded from:
+# (Partial) Test vectors downloaded from:
 #
 # https://csrc.nist.gov/projects/cryptographic-algorithm-validation-program/cavp-testing-block-cipher-modes
 #
 # Specifically Key Wrap Test Vectors (SP 800-38F):
 #
 # https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/mac/kwtestvectors.zip
+#
+# We don't include the 192-bit tests, though they all worked when this test suite was written.
+# We also don't include the _inv tests as those aren't supported in OpenSSL yet.
 
 use strict;
 use warnings;
@@ -15,7 +18,8 @@ use Test::More;
 
 if ($ENV{with_openssl} eq 'yes')
 {
-	plan tests => 6000;
+	# plan tests => 6000;
+	plan tests => 4000;
 }
 else
 {
@@ -23,7 +27,8 @@ else
 }
 
 my $algo;
-my @txtfiles = ("KW_AD_128.txt", "KW_AD_192.txt", "KW_AD_256.txt", "KW_AE_128.txt", "KW_AE_192.txt", "KW_AE_256.txt", "KWP_AD_128.txt", "KWP_AD_192.txt", "KWP_AD_256.txt", "KWP_AE_128.txt", "KWP_AE_192.txt", "KWP_AE_256.txt");
+# my @txtfiles = ("KW_AD_128.txt", "KW_AD_192.txt", "KW_AD_256.txt", "KW_AE_128.txt", "KW_AE_192.txt", "KW_AE_256.txt", "KWP_AD_128.txt", "KWP_AD_192.txt", "KWP_AD_256.txt", "KWP_AE_128.txt", "KWP_AE_192.txt", "KWP_AE_256.txt");
+my @txtfiles = ("KW_AD_128.txt", "KW_AD_256.txt", "KW_AE_128.txt", "KW_AE_256.txt", "KWP_AD_128.txt", "KWP_AD_256.txt", "KWP_AE_128.txt", "KWP_AE_256.txt");
 
 foreach my $txtfile (@txtfiles) {
 	open(my $in_txtfile, '<', $txtfile) || die;

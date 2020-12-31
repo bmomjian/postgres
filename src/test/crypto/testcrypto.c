@@ -24,7 +24,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-#include "common/hex_encode.h"
+#include "common/hex.h"
 #include "common/cipher.h"
 #include "common/logging.h"
 #include "getopt_long.h"

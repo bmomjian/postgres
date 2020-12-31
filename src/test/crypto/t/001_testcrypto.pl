@@ -20,7 +20,8 @@ use Test::More;
 
 if ($ENV{with_openssl} eq 'yes')
 {
-	plan tests => 9450;
+	#	plan tests => 9450;
+	plan tests => 6296;
 }
 else
 {
