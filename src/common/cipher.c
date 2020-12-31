@@ -23,7 +23,7 @@ static void cipher_failure(void) pg_attribute_noreturn();
 
 
 PgCipherCtx *
-pg_cipher_ctx_create(int cipher, uint8 *key, int klen, bool enc)
+pg_cipher_ctx_create(int cipher, unsigned char *key, int klen, bool enc)
 {
 	cipher_failure();
 	return NULL;				/* keep compiler quiet */
@@ -33,6 +33,13 @@ void
 pg_cipher_ctx_free(PgCipherCtx *ctx)
 {
 	cipher_failure();
+}
+
+int
+pg_cipher_blocksize(PgCipherCtx *ctx)
+{
+	cipher_failure();
+	return -1;					/* keep compiler quiet */
 }
 
 bool
@@ -50,6 +57,22 @@ pg_cipher_decrypt(PgCipherCtx *ctx, const unsigned char *ciphertext,
 				  const int inlen, unsigned char *plaintext, int *outlen,
 				  const unsigned char *iv, const int ivlen,
 				  unsigned char *intag, const int taglen)
+{
+	cipher_failure();
+	return false;				/* keep compiler quiet */
+}
+
+bool
+pg_cipher_keywrap(PgCipherCtx *ctx, const unsigned char *plaintext,
+				  const int inlen, unsigned char *ciphertext, int *outlen)
+{
+	cipher_failure();
+	return false;				/* keep compiler quiet */
+}
+
+bool
+pg_cipher_keyunwrap(PgCipherCtx *ctx, const unsigned char *ciphertext,
+					const int inlen, unsigned char *plaintext, int *outlen)
 {
 	cipher_failure();
 	return false;				/* keep compiler quiet */

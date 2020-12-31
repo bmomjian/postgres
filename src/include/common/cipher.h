@@ -25,7 +25,9 @@
  * algorithm.
  */
 #define PG_CIPHER_AES_GCM			0
-#define PG_MAX_CIPHER_ID			1
+#define PG_CIPHER_AES_KW			1
+#define PG_CIPHER_AES_KWP			2
+#define PG_MAX_CIPHER_ID			3
 
 /* AES128/192/256 various length definitions */
 #define PG_AES128_KEY_LEN			(128 / 8)
@@ -45,8 +47,9 @@ typedef EVP_CIPHER_CTX PgCipherCtx;
 typedef void PgCipherCtx;
 #endif
 
-extern PgCipherCtx *pg_cipher_ctx_create(int cipher, uint8 *key, int klen,
+extern PgCipherCtx *pg_cipher_ctx_create(int cipher, unsigned char *key, int klen,
 										 bool enc);
+
 extern void pg_cipher_ctx_free(PgCipherCtx *ctx);
 extern bool pg_cipher_encrypt(PgCipherCtx *ctx,
 							  const unsigned char *plaintext, const int inlen,
@@ -58,5 +61,14 @@ extern bool pg_cipher_decrypt(PgCipherCtx *ctx,
 							  unsigned char *plaintext, int *outlen,
 							  const unsigned char *iv, const int ivlen,
 							  unsigned char *intag, const int taglen);
+
+extern bool pg_cipher_keywrap(PgCipherCtx *ctx,
+							  const unsigned char *plaintext, const int inlen,
+							  unsigned char *ciphertext, int *outlen);
+extern bool pg_cipher_keyunwrap(PgCipherCtx *ctx,
+								const unsigned char *ciphertext, const int inlen,
+								unsigned char *plaintext, int *outlen);
+
+extern int pg_cipher_blocksize(PgCipherCtx *ctx);
 
 #endif							/* PG_CIPHER_H */

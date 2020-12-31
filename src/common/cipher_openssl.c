@@ -31,7 +31,8 @@
 typedef const EVP_CIPHER *(*ossl_EVP_cipher_func) (void);
 
 static ossl_EVP_cipher_func get_evp_aes_gcm(int klen);
-static EVP_CIPHER_CTX *ossl_cipher_ctx_create(int cipher, uint8 *key, int klen,
+static ossl_EVP_cipher_func get_evp_aes_kw(int klen);
+static EVP_CIPHER_CTX *ossl_cipher_ctx_create(int cipher, unsigned char *key, int klen,
 											  bool enc);
 
 /*
@@ -39,7 +40,7 @@ static EVP_CIPHER_CTX *ossl_cipher_ctx_create(int cipher, uint8 *key, int klen,
  * by identifer like PG_CIPHER_XXX.
  */
 PgCipherCtx *
-pg_cipher_ctx_create(int cipher, uint8 *key, int klen, bool enc)
+pg_cipher_ctx_create(int cipher, unsigned char *key, int klen, bool enc)
 {
 	PgCipherCtx *ctx = NULL;
 
@@ -55,6 +56,14 @@ void
 pg_cipher_ctx_free(PgCipherCtx *ctx)
 {
 	EVP_CIPHER_CTX_free(ctx);
+}
+
+int
+pg_cipher_blocksize(PgCipherCtx *ctx)
+{
+	Assert(ctx);
+
+	return EVP_CIPHER_CTX_block_size(ctx);
 }
 
 /*
@@ -125,6 +134,7 @@ pg_cipher_encrypt(PgCipherCtx *ctx,
 
 	return true;
 }
+
 /*
  * Decryption routine
  *
@@ -194,6 +204,86 @@ pg_cipher_decrypt(PgCipherCtx *ctx,
 }
 
 /*
+ * Routine to perform key wrapping for data provided.
+ *
+ * ctx is the encryption context which must have been created previously.
+ *
+ * plaintext is the data/key we are going to encrypt/wrap
+ * inlen is the length of the data
+ *
+ * ciphertext is the wrapped result
+ * outlen is the encrypted length (will be larger than input!)
+ */
+bool
+pg_cipher_keywrap(PgCipherCtx *ctx,
+				  const unsigned char *plaintext, const int inlen,
+				  unsigned char *ciphertext, int *outlen)
+{
+	int			len;
+	int			enclen;
+
+	Assert(ctx != NULL);
+
+	/*
+	 * This is the function which is actually performing the
+	 * encryption for us.
+	 */
+	if (!EVP_EncryptUpdate(ctx, ciphertext, &len, plaintext, inlen))
+		return false;
+
+	enclen = len;
+
+	/* Finalize the encryption, which could add more to output. */
+	if (!EVP_EncryptFinal_ex(ctx, ciphertext + enclen, &len))
+		return false;
+
+	*outlen = enclen + len;
+
+	return true;
+}
+
+/*
+ * Routine to perform key unwrapping of the data provided.
+ *
+ * ctx is the encryption context which must have been created previously.
+ *
+ * ciphertext is the wrapped key we are going to unwrap
+ * inlen is the length of the data to decrypt/unwrap
+ *
+ * plaintext is the decrypted result
+ * outlen is the decrypted length (will be smaller than input!)
+ */
+bool
+pg_cipher_keyunwrap(PgCipherCtx *ctx,
+					const unsigned char *ciphertext, const int inlen,
+					unsigned char *plaintext, int *outlen)
+{
+	int			declen;
+	int			len;
+
+	/*
+	 * This is the function which is actually performing the
+	 * decryption for us.
+	 */
+	if (!EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, inlen))
+		return false;
+
+	declen = len;
+
+	/*
+	 * Finalize the decryption, which could add more to output,
+	 * this is also the step which checks the tag and we MUST
+	 * fail if this indicates an invalid result!
+	 */
+	if (!EVP_DecryptFinal_ex(ctx, plaintext + declen, &len))
+		return false;
+
+	*outlen = declen + len;
+
+	return true;
+}
+
+/*
  * Returns the correct cipher functions for OpenSSL based
  * on the key length requested.
  */
@@ -214,11 +304,51 @@ get_evp_aes_gcm(int klen)
 }
 
 /*
+ * Returns the correct cipher functions for OpenSSL based
+ * on the key length requested.
+ */
+static ossl_EVP_cipher_func
+get_evp_aes_kw(int klen)
+{
+	switch (klen)
+	{
+		case PG_AES128_KEY_LEN:
+			return EVP_aes_128_wrap;
+		case PG_AES192_KEY_LEN:
+			return EVP_aes_192_wrap;
+		case PG_AES256_KEY_LEN:
+			return EVP_aes_256_wrap;
+		default:
+			return NULL;
+	}
+}
+
+/*
+ * Returns the correct cipher functions for OpenSSL based
+ * on the key length requested.
+ */
+static ossl_EVP_cipher_func
+get_evp_aes_kwp(int klen)
+{
+	switch (klen)
+	{
+		case PG_AES128_KEY_LEN:
+			return EVP_aes_128_wrap_pad;
+		case PG_AES192_KEY_LEN:
+			return EVP_aes_192_wrap_pad;
+		case PG_AES256_KEY_LEN:
+			return EVP_aes_256_wrap_pad;
+		default:
+			return NULL;
+	}
+}
+
+/*
  * Initialize and return an EVP_CIPHER_CTX. Returns NULL if the given
  * cipher algorithm is not supported or on failure.
  */
 static EVP_CIPHER_CTX *
-ossl_cipher_ctx_create(int cipher, uint8 *key, int klen, bool enc)
+ossl_cipher_ctx_create(int cipher, unsigned char *key, int klen, bool enc)
 {
 	EVP_CIPHER_CTX			*ctx;
 	ossl_EVP_cipher_func	func;
@@ -234,6 +364,28 @@ ossl_cipher_ctx_create(int cipher, uint8 *key, int klen, bool enc)
 	{
 		case PG_CIPHER_AES_GCM:
 			func = get_evp_aes_gcm(klen);
+			if (!func)
+				goto failed;
+			break;
+		case PG_CIPHER_AES_KW:
+			func = get_evp_aes_kw(klen);
+			/*
+			 * Since wrapping will produce more output then input, and
+			 * we have to be ready for that, OpenSSL requires that we
+			 * explicitly enable wrapping for the context.
+			 */
+			EVP_CIPHER_CTX_set_flags(ctx, EVP_CIPHER_CTX_FLAG_WRAP_ALLOW);
+			if (!func)
+				goto failed;
+			break;
+		case PG_CIPHER_AES_KWP:
+			func = get_evp_aes_kwp(klen);
+			/*
+			 * Since wrapping will produce more output then input, and
+			 * we have to be ready for that, OpenSSL requires that we
+			 * explicitly enable wrapping for the context.
+			 */
+			EVP_CIPHER_CTX_set_flags(ctx, EVP_CIPHER_CTX_FLAG_WRAP_ALLOW);
 			if (!func)
 				goto failed;
 			break;
