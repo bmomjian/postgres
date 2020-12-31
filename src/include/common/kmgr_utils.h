@@ -47,52 +47,33 @@
 /* Maximum length of key the key manager can store */
 #define KMGR_MAX_KEY_LEN			256
 #define KMGR_MAX_KEY_LEN_BYTES		KMGR_MAX_KEY_LEN / 8
-#define KMGR_MAX_WRAPPED_KEY_LEN	KmgrSizeOfCipherText(KMGR_MAX_KEY_LEN)
 
 
 /*
  * Cryptographic key data structure.
  *
- * This is the structure we use to write out the encrypted keys.
+ * This is the structure we use to write out the encrypted keys and
+ * which we use to store the keys in shared memory.
  *
- * pgkey_id is the identifier for this key (should be same as the
- * file name and be one of KMGR_KEY_ID_* from above).  This is what
- * we consider our 'context' or 'fixed' portion of the deterministic
- * IV we create.
+ * Note that wrapping this structure results in an encrypted byte
+ * string which is what we actually write and then read back in.
  *
- * counter is updated each time we use the cluster KEK to encrypt a
- * new key.  This is our the 'invocation' field of the deterministic
- * IV we create.
- *
- * Absolutely essential when using GCM (or CTR) is that the IV is unique,
- * for a given key, but a deterministic IV such as this is perfectly
- * acceptable and encouraged.  If (and only if!) the KEK is changed to a
- * new key, then we can re-initialize the counter.
- *
- * Detailed discussion of deterministic IV creation can be found here:
- *
- * https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf
- *
- * tag is the GCM tag which is produced and must be validated in order
- * to be able to trust the results of our decryption.
- *
- * encrypted_key is the encrypted key length (as an int) + encrypted key.
+ * klen is the key length in bytes
+ * key is the encryption key of klen length
  */
 typedef struct CryptoKey
 {
-	uint64	pgkey_id;								/* Upper half of IV */
-	uint64	counter;								/* Lower half of IV */
-	unsigned char tag[16];							/* GCM tag */
-	unsigned char encrypted_key[sizeof(int) + KMGR_MAX_KEY_LEN_BYTES];
+	uint32		  klen;
+	unsigned char key[KMGR_MAX_KEY_LEN_BYTES];
 } CryptoKey;
 
-extern bool kmgr_wrap_key(PgCipherCtx *ctx, CryptoKey *in, CryptoKey *out);
-extern bool kmgr_unwrap_key(PgCipherCtx *ctx, CryptoKey *in, CryptoKey *out);
+extern bool kmgr_wrap_key(PgCipherCtx *ctx, CryptoKey *in, unsigned char *out, int *outlen);
+extern bool kmgr_unwrap_key(PgCipherCtx *ctx, unsigned char *in, int inlen, CryptoKey *out);
 extern bool kmgr_verify_cluster_key(unsigned char *cluster_key,
-								    CryptoKey *in_keys, CryptoKey *out_keys,
-									int nkey);
+									unsigned char **in_keys, int *klens, CryptoKey *out_keys,
+									int nkeys);
 extern int	kmgr_run_cluster_key_command(char *cluster_key_command,
 												char *buf, int size, char *dir);
-extern CryptoKey *kmgr_get_cryptokeys(const char *path, int *nkeys);
+extern int kmgr_get_cryptokeys(const char *path, unsigned char **keys, int *klens);
 
 #endif							/* KMGR_UTILS_H */

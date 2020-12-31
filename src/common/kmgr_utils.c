@@ -45,44 +45,25 @@ static FILE *open_pipe_stream(const char *command);
 static int	close_pipe_stream(FILE *file);
 #endif
 
-static void read_one_keyfile(const char *dataDir, uint32 id, CryptoKey *key_p);
+static void read_one_keyfile(const char *cryptoKeyDir, uint32 id, unsigned char **key_p, int *klen);
 
 /*
- * Encrypt the given data. Return true and set encrypted data to 'out' if
- * success.  Otherwise return false. The caller must allocate sufficient space
+ * Wrap the given CryptoKey.
+ *
+ * Returns true and writes encrypted/wrapped/padded data to 'out', and the length
+ * of the result to outlen, if success.
+ *
+ * Otherwise returns false. The caller must allocate sufficient space
  * for cipher data calculated by using KmgrSizeOfCipherText(). Please note that
  * this function modifies 'out' data even on failure case.
  */
 bool
-kmgr_wrap_key(PgCipherCtx *ctx, CryptoKey *in, CryptoKey *out)
+kmgr_wrap_key(PgCipherCtx *ctx, CryptoKey *in, unsigned char *out, int *outlen)
 {
-	int enclen;
-	unsigned char iv[sizeof(in->pgkey_id) + sizeof(in->counter)];
-
 	Assert(ctx && in && out);
 
-	/* Key ID remains the same */
-	out->pgkey_id = in->pgkey_id;
-
-	/* Increment the counter */
-	out->counter = in->counter + 1;
-
-	/* Construct the IV we are going to use, see kmgr_utils.h */
-	memcpy(iv, &out->pgkey_id, sizeof(out->pgkey_id));
-	memcpy(iv + sizeof(out->pgkey_id), &out->counter, sizeof(out->counter));
-
-	if (!pg_cipher_encrypt(ctx,
-						   in->encrypted_key, /* Plaintext source, key length + key */
-						   sizeof(in->encrypted_key), /* Full data length */
-						   out->encrypted_key, /* Ciphertext result */
-						   &enclen, /* Resulting length, must match input for us */
-						   iv, /* Generated IV from above */
-						   sizeof(iv), /* Length of the IV */
-						   out->tag, /* Resulting tag */
-						   sizeof(out->tag))) /* Length of our tag */
+	if (!pg_cipher_keywrap(ctx, (unsigned char *) in, sizeof(CryptoKey), out, outlen))
 		return false;
-
-	Assert(enclen == sizeof(in->encrypted_key));
 
 	return true;
 }
@@ -94,34 +75,16 @@ kmgr_wrap_key(PgCipherCtx *ctx, CryptoKey *in, CryptoKey *out)
  * this function modifies 'out' data even on failure case.
  */
 bool
-kmgr_unwrap_key(PgCipherCtx *ctx, CryptoKey *in, CryptoKey *out)
+kmgr_unwrap_key(PgCipherCtx *ctx, unsigned char *in, int inlen, CryptoKey *out)
 {
-	int declen;
-	unsigned char iv[sizeof(in->pgkey_id) + sizeof(in->counter)];
+	int outlen;
 
 	Assert(ctx && in && out);
 
-	out->pgkey_id = in->pgkey_id;
-	out->counter = in->counter;
-	memcpy(out->tag, in->tag, sizeof(in->tag));
-
-	/* Construct the IV we are going to use, see kmgr_utils.h */
-	memcpy(iv, &out->pgkey_id, sizeof(out->pgkey_id));
-	memcpy(iv + sizeof(out->pgkey_id), &out->counter, sizeof(out->counter));
-
-	/* Decrypt encrypted data */
-	if (!pg_cipher_decrypt(ctx,
-						   in->encrypted_key, /* Encrypted source */
-						   sizeof(in->encrypted_key), /* Length of encrypted data */
-						   out->encrypted_key, /* Plaintext result */
-						   &declen, /* Length of plaintext */
-						   iv, /* IV we constructed above */
-						   sizeof(iv), /* Size of our IV */
-						   in->tag, /* Tag which will be verified */
-						   sizeof(in->tag))) /* Size of our tag */
+	if (!pg_cipher_keyunwrap(ctx, in, inlen, (unsigned char *) out, &outlen))
 		return false;
 
-	Assert(declen == sizeof(in->encrypted_key));
+	Assert(outlen == sizeof(CryptoKey));
 
 	return true;
 }
@@ -135,25 +98,25 @@ kmgr_unwrap_key(PgCipherCtx *ctx, CryptoKey *in, CryptoKey *out)
  */
 bool
 kmgr_verify_cluster_key(unsigned char *cluster_key,
-					   CryptoKey *in_keys, CryptoKey *out_keys, int nkeys)
+					   unsigned char **in_keys, int *klens, CryptoKey *out_keys, int nkeys)
 {
 	PgCipherCtx *ctx;
 
 	/*
 	 * Create decryption context with cluster KEK.
 	 */
-	ctx = pg_cipher_ctx_create(PG_CIPHER_AES_GCM, cluster_key,
+	ctx = pg_cipher_ctx_create(PG_CIPHER_AES_KWP, cluster_key,
 							   KMGR_CLUSTER_KEY_LEN, false);
 
 	for (int i = 0; i < nkeys; i++)
 	{
-		if (!kmgr_unwrap_key(ctx, &(in_keys[i]), &(out_keys[i])))
+		if (!kmgr_unwrap_key(ctx, in_keys[i], klens[i], &(out_keys[i])))
 		{
 			/* The cluster key is not correct */
 			pg_cipher_ctx_free(ctx);
 			return false;
 		}
-		explicit_bzero(&(in_keys[i]), sizeof(in_keys[i]));
+		explicit_bzero(in_keys[i], klens[i]);
 	}
 
 	/* The cluster key is correct, free the cipher context */
@@ -371,12 +334,26 @@ close_pipe_stream(FILE *file)
 }
 #endif							/* FRONTEND */
 
-CryptoKey *
-kmgr_get_cryptokeys(const char *path, int *nkeys)
+/*
+ * Reads all of the keys which are located at path.
+ *
+ * This routine simply reads in the raw encrypted/wrapped keys,
+ * it does not handle any decryption, see kmgr_key_unwrap().
+ *
+ * Returns the number of keys returned.
+ *
+ * For each key returned, the key and key length are returned
+ * in the keys and klens arrays respectfully.
+ *
+ * Note that keys and klens must be allocated before calling
+ * this function as arrays of at least KMGR_MAX_INTERNAL_KEYS length.
+ */
+int
+kmgr_get_cryptokeys(const char *path, unsigned char **keys, int *klens)
 {
 	struct dirent *de;
 	DIR			*dir;
-	CryptoKey	*keys;
+	int			nkeys = 0;
 
 #ifndef FRONTEND
 	if ((dir = AllocateDir(path)) == NULL)
@@ -388,9 +365,6 @@ kmgr_get_cryptokeys(const char *path, int *nkeys)
 	if ((dir = opendir(path)) == NULL)
 		pg_log_fatal("could not open directory \"%s\": %m", path);
 #endif
-
-	keys = (CryptoKey *) palloc0(sizeof(CryptoKey) * KMGR_MAX_INTERNAL_KEYS);
-	*nkeys = 0;
 
 #ifndef FRONTEND
 	while ((de = ReadDir(dir, LIVE_KMGR_DIR)) != NULL)
@@ -411,7 +385,7 @@ kmgr_get_cryptokeys(const char *path, int *nkeys)
 #endif
 			}
 
-			if (*nkeys >= KMGR_MAX_INTERNAL_KEYS)
+			if (nkeys >= KMGR_MAX_INTERNAL_KEYS)
 			{
 #ifndef FRONTEND
 				elog(ERROR, "too many cryptographic keys");
@@ -420,8 +394,8 @@ kmgr_get_cryptokeys(const char *path, int *nkeys)
 #endif
 			}
 
-			read_one_keyfile(path, id, &(keys[id]));
-			(*nkeys)++;
+			read_one_keyfile(path, id, &(keys[id]), &(klens[id]));
+			nkeys++;
 		}
 	}
 
@@ -431,15 +405,16 @@ kmgr_get_cryptokeys(const char *path, int *nkeys)
 	closedir(dir);
 #endif
 
-	return keys;
+	return nkeys;
 }
 
 static void
-read_one_keyfile(const char *cryptoKeyDir, uint32 id, CryptoKey *key_p)
+read_one_keyfile(const char *cryptoKeyDir, uint32 id, unsigned char **key_p, int *klen)
 {
 	char		path[MAXPGPATH];
 	int			fd;
 	int			r;
+	struct stat st;
 
 	CryptoKeyFilePath(path, cryptoKeyDir, id);
 
@@ -449,19 +424,33 @@ read_one_keyfile(const char *cryptoKeyDir, uint32 id, CryptoKey *key_p)
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\" for reading: %m",
 						path)));
+	else
+		if (fstat(fd, &st))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not stat file \"%s\": %m",
+							path)));
 #else
 	if ((fd = open(path, O_RDONLY | PG_BINARY, 0)) == -1)
 		pg_log_fatal("could not open file \"%s\" for reading: %m",
 					 path);
+	else
+		if (fstat(fd, &st))
+			pg_log_fatal("could not stat file \"%s\": %m",
+						 path);
 #endif
+
+	*klen = st.st_size;
 
 #ifndef FRONTEND
 	pgstat_report_wait_start(WAIT_EVENT_KEY_FILE_READ);
 #endif
 
+	*key_p = (unsigned char *) palloc0(*klen);
+
 	/* Get key bytes */
-	r = read(fd, key_p, sizeof(CryptoKey));
-	if (r != sizeof(CryptoKey))
+	r = read(fd, *key_p, *klen);
+	if (r != *klen)
 	{
 		if (r < 0)
 		{
@@ -478,11 +467,11 @@ read_one_keyfile(const char *cryptoKeyDir, uint32 id, CryptoKey *key_p)
 #ifndef FRONTEND
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("could not read file \"%s\": read %d of %zu",
-							path, r, sizeof(CryptoKey))));
+					 errmsg("could not read file \"%s\": read %d of %u",
+							path, r, *klen)));
 #else
-			pg_log_fatal("could not read file \"%s\": read %d of %zu",
-						 path, r, sizeof(CryptoKey));
+			pg_log_fatal("could not read file \"%s\": read %d of %u",
+						 path, r, *klen);
 #endif
 		}
 	}

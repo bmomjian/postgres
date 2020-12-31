@@ -56,7 +56,7 @@ extern char *bootstrap_old_key_datadir;
 extern int	bootstrap_file_encryption_keylen;
 
 static void bzeroKmgrKeys(int status, Datum arg);
-static void KmgrSaveCryptoKeys(const char *dir, CryptoKey *keys);
+static void KmgrSaveCryptoKeys(const char *dir, unsigned char **keys, int *klens);
 static CryptoKey *generate_crypto_key(int len);
 
 /*
@@ -66,7 +66,8 @@ void
 BootStrapKmgr(void)
 {
 	char		live_path[MAXPGPATH];
-	CryptoKey	*keys_wrap;
+	unsigned char	*keys_wrap[KMGR_MAX_INTERNAL_KEYS];
+	int			klens[KMGR_MAX_INTERNAL_KEYS];
 	int			nkeys;
 	char		cluster_key_hex[ALLOC_KMGR_CLUSTER_KEY_LEN];
 	int			cluster_key_hex_len;
@@ -119,17 +120,17 @@ BootStrapKmgr(void)
 	/* generate new cluster file encryption keys */
 	if (bootstrap_old_key_datadir == NULL)
 	{
-		CryptoKey		bootstrap_keys_wrap[KMGR_MAX_INTERNAL_KEYS];
+		unsigned char *bootstrap_keys_wrap[KMGR_MAX_INTERNAL_KEYS];
+		int				klens[KMGR_MAX_INTERNAL_KEYS];
 		PgCipherCtx	   *cluster_key_ctx;
 
 		/* Create KEK encryption context */
-		cluster_key_ctx = pg_cipher_ctx_create(PG_CIPHER_AES_GCM, cluster_key,
+		cluster_key_ctx = pg_cipher_ctx_create(PG_CIPHER_AES_KWP, cluster_key,
 									   KMGR_CLUSTER_KEY_LEN, true);
 		if (!cluster_key_ctx)
 			elog(ERROR, "could not initialize encryption context");
 	
 		/* Wrap all data encryption keys by key encryption key */
-/* CFE DEBUG */	fputc('\n', stderr);
 		for (int id = 0; id < KMGR_MAX_INTERNAL_KEYS; id++)
 		{
 			CryptoKey *key;
@@ -137,22 +138,9 @@ BootStrapKmgr(void)
 			/* generate a data encryption key */
 			key = generate_crypto_key(bootstrap_file_encryption_keylen / 8);
 
-			/* output generated random string as hex */
-			{
-				char str[MAXPGPATH];
-				int out_len;
+			bootstrap_keys_wrap[id] = palloc0(KMGR_MAX_KEY_LEN_BYTES + pg_cipher_blocksize(cluster_key_ctx));
 
-				out_len = hex_encode((char *)(key->encrypted_key) + sizeof(int),
-						   *(int *)(key->encrypted_key), str);
-				str[out_len] = '\0';
-				fprintf(stderr,
-						"CFE DEBUG: generated, insecure, key %d: %s\n", id, str);
-			}
-
-			/* Set this key's ID */
-			key->pgkey_id = id;
-		
-			if (!kmgr_wrap_key(cluster_key_ctx, key, &(bootstrap_keys_wrap[id])))
+			if (!kmgr_wrap_key(cluster_key_ctx, key, bootstrap_keys_wrap[id], &(klens[id])))
 			{
 				pg_cipher_ctx_free(cluster_key_ctx);
 				elog(ERROR, "failed to wrap data encryption key");
@@ -162,9 +150,8 @@ BootStrapKmgr(void)
 		}
 	
 		/* Save data encryption keys to the disk */
-		KmgrSaveCryptoKeys(LIVE_KMGR_DIR, bootstrap_keys_wrap);
+		KmgrSaveCryptoKeys(LIVE_KMGR_DIR, bootstrap_keys_wrap, klens);
 
-		explicit_bzero(bootstrap_keys_wrap, sizeof(bootstrap_keys_wrap));
 		pg_cipher_ctx_free(cluster_key_ctx);
 	}
 
@@ -175,12 +162,12 @@ BootStrapKmgr(void)
 	 * later encrypting during bootstrap mode.
 	 */
 
-	/* Get the crypto keys from the file */
-	keys_wrap = kmgr_get_cryptokeys(LIVE_KMGR_DIR, &nkeys);
+	/* Get the crypto keys from the live directory */
+	nkeys = kmgr_get_cryptokeys(LIVE_KMGR_DIR, keys_wrap, klens);
 	Assert(nkeys == KMGR_MAX_INTERNAL_KEYS);
 
-	if (!kmgr_verify_cluster_key(cluster_key, keys_wrap, bootstrap_keys,
-								KMGR_MAX_INTERNAL_KEYS))
+	if (!kmgr_verify_cluster_key(cluster_key, keys_wrap, klens, bootstrap_keys,
+								nkeys))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("supplied cluster key does not match expected cluster_key")));
@@ -224,8 +211,9 @@ KmgrShmemInit(void)
 void
 InitializeKmgr(void)
 {
-	CryptoKey	*keys_wrap;
 	int			nkeys;
+	unsigned char	*keys_wrap[KMGR_MAX_INTERNAL_KEYS];
+	int			klens[KMGR_MAX_INTERNAL_KEYS];
 	char		cluster_key_hex[ALLOC_KMGR_CLUSTER_KEY_LEN];
 	int			cluster_key_hex_len;
 	struct stat buffer;
@@ -280,34 +268,16 @@ InitializeKmgr(void)
 						KMGR_CLUSTER_KEY_LEN * 2)));
 
 	/* Get the crypto keys from the file */
-	keys_wrap = kmgr_get_cryptokeys(LIVE_KMGR_DIR, &nkeys);
+	nkeys = kmgr_get_cryptokeys(LIVE_KMGR_DIR, keys_wrap, klens);
 	Assert(nkeys == KMGR_MAX_INTERNAL_KEYS);
 
 	/*
 	 * Verify cluster key and prepare a data encryption key in plaintext in shared memory.
 	 */
-	if (!kmgr_verify_cluster_key(cluster_key, keys_wrap, KmgrShmem->intlKeys,
-								KMGR_MAX_INTERNAL_KEYS))
+	if (!kmgr_verify_cluster_key(cluster_key, keys_wrap, klens, KmgrShmem->intlKeys, nkeys))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("supplied cluster key does not match expected cluster key")));
-
-	/* Wrap all data encryption keys by key encryption key */
-/* CFE DEBUG */	fputc('\n', stderr);
-	for (int id = 0; id < KMGR_MAX_INTERNAL_KEYS; id++)
-	{
-		/* output generated random string as hex */
-		{
-			char str[MAXPGPATH];
-			int  out_len;
-
-			out_len = hex_encode((char *)(KmgrShmem->intlKeys[id].encrypted_key) + sizeof(int),
-					   *(int *)(KmgrShmem->intlKeys[id].encrypted_key), str);
-			str[out_len] = '\0';
-			fprintf(stderr,
-					"CFE DEBUG: decrypted, insecure, key %d: %s\n", id, str);
-		}
-	}
 
 	explicit_bzero(cluster_key_hex, cluster_key_hex_len);
 	explicit_bzero(cluster_key, KMGR_CLUSTER_KEY_LEN);
@@ -340,10 +310,9 @@ generate_crypto_key(int len)
 	Assert(len <= KMGR_MAX_KEY_LEN);
 	newkey = (CryptoKey *) palloc0(sizeof(CryptoKey));
 
-	/* We store the key as length + key into 'encrypted_key' */
-	memcpy(newkey->encrypted_key, &len, sizeof(len));
+	newkey->klen = len;
 
-	if (!pg_strong_random(newkey->encrypted_key + sizeof(len), len))
+	if (!pg_strong_random(newkey->key, len))
 		elog(ERROR, "failed to generate new file encryption key");
 
 	return newkey;
@@ -353,7 +322,7 @@ generate_crypto_key(int len)
  * Save the given file encryption keys to the disk.
  */
 static void
-KmgrSaveCryptoKeys(const char *dir, CryptoKey *keys)
+KmgrSaveCryptoKeys(const char *dir, unsigned char **keys, int *klens)
 {
 	elog(DEBUG2, "saving all cryptographic keys");
 
@@ -372,7 +341,7 @@ KmgrSaveCryptoKeys(const char *dir, CryptoKey *keys)
 
 		errno = 0;
 		pgstat_report_wait_start(WAIT_EVENT_KEY_FILE_WRITE);
-		if (write(fd, &(keys[i]), sizeof(CryptoKey)) != sizeof(CryptoKey))
+		if (write(fd, keys[i], klens[i]) != klens[i])
 		{
 			/* if write didn't set errno, assume problem is no disk space */
 			if (errno == 0)

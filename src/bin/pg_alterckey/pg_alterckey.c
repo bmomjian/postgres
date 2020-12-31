@@ -58,7 +58,9 @@ static char *old_cluster_key_cmd = NULL,
 			*new_cluster_key_cmd = NULL;
 static char old_cluster_key[KMGR_CLUSTER_KEY_LEN],
 			new_cluster_key[KMGR_CLUSTER_KEY_LEN];
-static CryptoKey in_key, data_key, out_key;
+static CryptoKey data_key;
+unsigned char *in_key = NULL, *out_key = NULL;
+int in_klen, out_klen;
 static char top_path[MAXPGPATH], pid_path[MAXPGPATH], live_path[MAXPGPATH],
 			new_path[MAXPGPATH], old_path[MAXPGPATH];
 
@@ -554,13 +556,13 @@ reencrypt_data_keys(void)
 		bzero_keys_and_exit(RMDIR_EXIT);
 	}
 
-	old_ctx = pg_cipher_ctx_create(PG_CIPHER_AES_GCM,
+	old_ctx = pg_cipher_ctx_create(PG_CIPHER_AES_KWP,
 								   (unsigned char *)old_cluster_key,
 								   KMGR_CLUSTER_KEY_LEN, true);
 	if (!old_ctx)
 			pg_log_error("could not initialize encryption context");
 
-	new_ctx = pg_cipher_ctx_create(PG_CIPHER_AES_GCM,
+	new_ctx = pg_cipher_ctx_create(PG_CIPHER_AES_KWP,
 								   (unsigned char *)new_cluster_key,
 								   KMGR_CLUSTER_KEY_LEN, true);
 	if (!new_ctx)
@@ -577,6 +579,7 @@ reencrypt_data_keys(void)
 			char src_path[MAXPGPATH], dst_path[MAXPGPATH];
 			int src_fd, dst_fd;
 			int len;
+			struct stat st;
 			uint32	id = strtoul(de->d_name, NULL, 10);
 
 			CryptoKeyFilePath(src_path, live_path, id);
@@ -595,35 +598,46 @@ reencrypt_data_keys(void)
 				bzero_keys_and_exit(RMDIR_EXIT);
 			}
 
+			if (fstat(src_fd, &st))
+			{
+				pg_log_error("could not stat file \"%s\": %m", dst_path);
+				bzero_keys_and_exit(RMDIR_EXIT);
+			}
+			
+			in_klen = st.st_size;
+			in_key = palloc0(in_klen);
+
 			/* Read the source key */
-			len = read(src_fd, &in_key, sizeof(CryptoKey));
-			if (len != sizeof(CryptoKey))
+			len = read(src_fd, in_key, in_klen);
+			if (len != in_klen)
 			{
 				if (len < 0)
 					pg_log_error("could read file \"%s\": %m", src_path);
 				else
-					pg_log_error("could read file \"%s\": read %d of %zu",
-							 src_path, len, sizeof(CryptoKey));
+					pg_log_error("could read file \"%s\": read %d of %u",
+							 src_path, len, in_klen);
 				bzero_keys_and_exit(RMDIR_EXIT);
 			}
 
 			/* decrypt with old key */
-			if (!kmgr_unwrap_key(old_ctx, &in_key, &data_key))
+			if (!kmgr_unwrap_key(old_ctx, in_key, in_klen, &data_key))
 			{
 				pg_log_error("incorrect old key specified");
 				bzero_keys_and_exit(RMDIR_EXIT);
 			}
 
+			out_key = palloc0(KMGR_MAX_KEY_LEN_BYTES + pg_cipher_blocksize(new_ctx));
+
 			/* encrypt with new key */
-			if (!kmgr_wrap_key(new_ctx, &data_key, &out_key))
+			if (!kmgr_wrap_key(new_ctx, &data_key, out_key, &out_klen))
 			{
 				pg_log_error("could not encrypt new key");
 				bzero_keys_and_exit(RMDIR_EXIT);
 			}			
 			
 			/* Write to the dest key */
-			len = write(dst_fd, &out_key, sizeof(CryptoKey));
-			if (len != sizeof(CryptoKey))
+			len = write(dst_fd, out_key, out_klen);
+			if (len != out_klen)
 			{
 				pg_log_error("could not write fie \"%s\"", dst_path);
 				bzero_keys_and_exit(RMDIR_EXIT);
@@ -672,9 +686,9 @@ bzero_keys_and_exit(exit_action action)
 	explicit_bzero(old_cluster_key, sizeof(old_cluster_key));
 	explicit_bzero(new_cluster_key, sizeof(new_cluster_key));
 
-	explicit_bzero(&in_key, sizeof(in_key));
+	if (in_key) explicit_bzero(in_key, in_klen);
 	explicit_bzero(&data_key, sizeof(data_key));
-	explicit_bzero(&out_key, sizeof(out_key));
+	if (out_key) explicit_bzero(out_key, out_klen);
 
 	if (action == RMDIR_EXIT)
 	{

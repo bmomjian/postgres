@@ -87,11 +87,11 @@ initdb -D dbname --cluster-key-command='ckey_passphrase.sh'
   </para>
 
   <para>
-   The data encryption keys are randomly generated and are 128, 192,
+   The data encryption keys are randomly generated and can be 128, 192,
    or 256-bits in length.  They are encrypted by the key encryption key
    (KEK) using Advanced Encryption Standard (<acronym>AES256</acronym>)
-   encryption in Galois/Counter Mode (<acronym>GCM</acronym>), which also
-   provides KEK authentication.
+   encryption in Key Wrap Padded Mode, which also provides KEK
+   authentication.
   </para>
  </sect1>
 </chapter>
