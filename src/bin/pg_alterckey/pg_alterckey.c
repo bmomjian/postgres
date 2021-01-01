@@ -50,6 +50,8 @@ typedef enum {
 	REPAIR_EXIT
 } exit_action;
 
+#define MAX_WRAPPED_KEY_LENGTH 64
+
 static int	lock_fd = -1;
 static bool pass_terminal_fd = false;
 int terminal_fd = -1;
@@ -59,7 +61,7 @@ static char *old_cluster_key_cmd = NULL,
 static char old_cluster_key[KMGR_CLUSTER_KEY_LEN],
 			new_cluster_key[KMGR_CLUSTER_KEY_LEN];
 static CryptoKey data_key;
-unsigned char *in_key = NULL, *out_key = NULL;
+unsigned char in_key[MAX_WRAPPED_KEY_LENGTH], out_key[MAX_WRAPPED_KEY_LENGTH];
 int in_klen, out_klen;
 static char top_path[MAXPGPATH], pid_path[MAXPGPATH], live_path[MAXPGPATH],
 			new_path[MAXPGPATH], old_path[MAXPGPATH];
@@ -534,7 +536,7 @@ retrieve_cluster_keys()
 	/* output newline */
 	puts("");
 
-	if (strcmp(old_cluster_key, new_cluster_key) == 0)
+	if (memcmp(old_cluster_key, new_cluster_key, KMGR_CLUSTER_KEY_LEN) == 0)
 	{
 		pg_log_error("cluster keys are identical, exiting\n");
 		bzero_keys_and_exit(RMDIR_EXIT);
@@ -558,7 +560,7 @@ reencrypt_data_keys(void)
 
 	old_ctx = pg_cipher_ctx_create(PG_CIPHER_AES_KWP,
 								   (unsigned char *)old_cluster_key,
-								   KMGR_CLUSTER_KEY_LEN, true);
+								   KMGR_CLUSTER_KEY_LEN, false);
 	if (!old_ctx)
 			pg_log_error("could not initialize encryption context");
 
@@ -600,12 +602,17 @@ reencrypt_data_keys(void)
 
 			if (fstat(src_fd, &st))
 			{
-				pg_log_error("could not stat file \"%s\": %m", dst_path);
+				pg_log_error("could not stat file \"%s\": %m", src_path);
 				bzero_keys_and_exit(RMDIR_EXIT);
 			}
 			
 			in_klen = st.st_size;
-			in_key = palloc0(in_klen);
+
+			if (in_klen > MAX_WRAPPED_KEY_LENGTH)
+			{
+				pg_log_error("invalid wrapped key length (%d) for file \"%s\"", in_klen, src_path);
+				bzero_keys_and_exit(RMDIR_EXIT);
+			}
 
 			/* Read the source key */
 			len = read(src_fd, in_key, in_klen);
@@ -626,7 +633,11 @@ reencrypt_data_keys(void)
 				bzero_keys_and_exit(RMDIR_EXIT);
 			}
 
-			out_key = palloc0(KMGR_MAX_KEY_LEN_BYTES + pg_cipher_blocksize(new_ctx));
+			if (KMGR_MAX_KEY_LEN_BYTES + pg_cipher_blocksize(new_ctx) > MAX_WRAPPED_KEY_LENGTH)
+			{
+				pg_log_error("invalid max wrapped key length");
+				bzero_keys_and_exit(RMDIR_EXIT);
+			}
 
 			/* encrypt with new key */
 			if (!kmgr_wrap_key(new_ctx, &data_key, out_key, &out_klen))
@@ -686,9 +697,9 @@ bzero_keys_and_exit(exit_action action)
 	explicit_bzero(old_cluster_key, sizeof(old_cluster_key));
 	explicit_bzero(new_cluster_key, sizeof(new_cluster_key));
 
-	if (in_key) explicit_bzero(in_key, in_klen);
+	explicit_bzero(in_key, sizeof(in_key));
 	explicit_bzero(&data_key, sizeof(data_key));
-	if (out_key) explicit_bzero(out_key, out_klen);
+	explicit_bzero(out_key, sizeof(out_key));
 
 	if (action == RMDIR_EXIT)
 	{
