@@ -526,7 +526,6 @@ AdjustFractDays(double frac, struct pg_tm *tm, fsec_t *fsec, int scale)
 	extra_days = (int) frac;
 	tm->tm_mday += extra_days;
 	frac -= extra_days;
-	AdjustFractSeconds(frac, tm, fsec, SECS_PER_DAY);
 }
 
 /* Fetch a fractional-second value with suitable error checking */
