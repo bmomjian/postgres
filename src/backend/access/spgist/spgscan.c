@@ -81,7 +81,10 @@ pairingheap_SpGistSearchItem_cmp(const pairingheap_node *a,
 static void
 spgFreeSearchItem(SpGistScanOpaque so, SpGistSearchItem *item)
 {
-	if (!so->state.attLeafType.attbyval &&
+	/* value is of type attType if isLeaf, else of type attLeafType */
+	/* (no, that is not backwards; yes, it's confusing) */
+	if (!(item->isLeaf ? so->state.attType.attbyval :
+		  so->state.attLeafType.attbyval) &&
 		DatumGetPointer(item->value) != NULL)
 		pfree(DatumGetPointer(item->value));
 
@@ -296,6 +299,7 @@ spgbeginscan(Relation rel, int keysz, int orderbysz)
 {
 	IndexScanDesc scan;
 	SpGistScanOpaque so;
+	TupleDesc	outTupDesc;
 	int			i;
 
 	scan = RelationGetIndexScan(rel, keysz, orderbysz);
@@ -314,8 +318,21 @@ spgbeginscan(Relation rel, int keysz, int orderbysz)
 											 "SP-GiST traversal-value context",
 											 ALLOCSET_DEFAULT_SIZES);
 
-	/* Set up indexTupDesc and xs_hitupdesc in case it's an index-only scan */
-	so->indexTupDesc = scan->xs_hitupdesc = RelationGetDescr(rel);
+	/*
+	 * Set up indexTupDesc and xs_hitupdesc in case it's an index-only scan.
+	 * (It's rather annoying to do this work when it might be wasted, but for
+	 * most opclasses we can re-use the index reldesc instead of making one.)
+	 */
+	if (so->state.attType.type ==
+		TupleDescAttr(RelationGetDescr(rel), 0)->atttypid)
+		outTupDesc = RelationGetDescr(rel);
+	else
+	{
+		outTupDesc = CreateTemplateTupleDesc(1);
+		TupleDescInitEntry(outTupDesc, 1, NULL,
+						   so->state.attType.type, -1, 0);
+	}
+	so->indexTupDesc = scan->xs_hitupdesc = outTupDesc;
 
 	/* Allocate various arrays needed for order-by scans */
 	if (scan->numberOfOrderBys > 0)
@@ -446,10 +463,19 @@ spgNewHeapItem(SpGistScanOpaque so, int level, ItemPointer heapPtr,
 
 	item->level = level;
 	item->heapPtr = *heapPtr;
-	/* copy value to queue cxt out of tmp cxt */
-	item->value = isnull ? (Datum) 0 :
-		datumCopy(leafValue, so->state.attLeafType.attbyval,
-				  so->state.attLeafType.attlen);
+
+	/*
+	 * If we need the reconstructed value, copy it to queue cxt out of tmp
+	 * cxt.  Caution: the leaf_consistent method may not have supplied a value
+	 * if we didn't ask it to, and mildly-broken methods might supply one of
+	 * the wrong type.  The correct leafValue type is attType not leafType.
+	 */
+	if (so->want_itup)
+		item->value = isnull ? (Datum) 0 :
+			datumCopy(leafValue, so->state.attType.attbyval,
+					  so->state.attType.attlen);
+	else
+		item->value = (Datum) 0;
 	item->traversalValue = NULL;
 	item->isLeaf = true;
 	item->recheck = recheck;
@@ -497,6 +523,7 @@ spgLeafTest(SpGistScanOpaque so, SpGistSearchItem *item,
 		in.nkeys = so->numberOfKeys;
 		in.orderbys = so->orderByData;
 		in.norderbys = so->numberOfNonNullOrderBys;
+		Assert(!item->isLeaf);	/* else reconstructedValue would be wrong type */
 		in.reconstructedValue = item->value;
 		in.traversalValue = item->traversalValue;
 		in.level = item->level;
@@ -563,6 +590,7 @@ spgInitInnerConsistentIn(spgInnerConsistentIn *in,
 	in->orderbys = so->orderByData;
 	in->nkeys = so->numberOfKeys;
 	in->norderbys = so->numberOfNonNullOrderBys;
+	Assert(!item->isLeaf);		/* else reconstructedValue would be wrong type */
 	in->reconstructedValue = item->value;
 	in->traversalMemoryContext = so->traversalCxt;
 	in->traversalValue = item->traversalValue;
@@ -589,6 +617,7 @@ spgMakeInnerItem(SpGistScanOpaque so,
 		: parentItem->level;
 
 	/* Must copy value out of temp context */
+	/* (recall that reconstructed values are of type leafType) */
 	item->value = out->reconstructedValues
 		? datumCopy(out->reconstructedValues[i],
 					so->state.attLeafType.attbyval,
