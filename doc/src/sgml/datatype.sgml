@@ -2775,7 +2775,7 @@ P <optional> <replaceable>years</replaceable>-<replaceable>months</replaceable>-
      <literal>'1.5 week'</literal> or <literal>'01:02:03.45'</literal>.  Such input is
      converted to the appropriate number of months, days, and seconds
      for storage.  When this would result in a fractional number of
-     months or days, the fraction is added to the lower-order fields
+     months or days, the fraction is added to the next lower-order internal field
      using the conversion factors 1 month = 30 days and 1 day = 24 hours.
      For example, <literal>'1.5 month'</literal> becomes 1 month and 15 days.
      Only seconds will ever be shown as fractional on output.
