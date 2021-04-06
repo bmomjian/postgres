@@ -372,6 +372,139 @@ ExecComputeStoredGenerated(ResultRelInfo *resultRelInfo,
 }
 
 /*
+ * ExecInitInsertProjection
+ *		Do one-time initialization of projection data for INSERT tuples.
+ *
+ * INSERT queries may need a projection to filter out junk attrs in the tlist.
+ *
+ * This is "one-time" for any given result rel, but we might touch
+ * more than one result rel in the course of a partitioned INSERT.
+ *
+ * This is also a convenient place to verify that the
+ * output of an INSERT matches the target table.
+ */
+static void
+ExecInitInsertProjection(ModifyTableState *mtstate,
+						 ResultRelInfo *resultRelInfo)
+{
+	ModifyTable *node = (ModifyTable *) mtstate->ps.plan;
+	Plan	   *subplan = outerPlan(node);
+	EState	   *estate = mtstate->ps.state;
+	List	   *insertTargetList = NIL;
+	bool		need_projection = false;
+	ListCell   *l;
+
+	/* Extract non-junk columns of the subplan's result tlist. */
+	foreach(l, subplan->targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(l);
+
+		if (!tle->resjunk)
+			insertTargetList = lappend(insertTargetList, tle);
+		else
+			need_projection = true;
+	}
+
+	/*
+	 * The junk-free list must produce a tuple suitable for the result
+	 * relation.
+	 */
+	ExecCheckPlanOutput(resultRelInfo->ri_RelationDesc, insertTargetList);
+
+	/* We'll need a slot matching the table's format. */
+	resultRelInfo->ri_newTupleSlot =
+		table_slot_create(resultRelInfo->ri_RelationDesc,
+						  &estate->es_tupleTable);
+
+	/* Build ProjectionInfo if needed (it probably isn't). */
+	if (need_projection)
+	{
+		TupleDesc	relDesc = RelationGetDescr(resultRelInfo->ri_RelationDesc);
+
+		/* need an expression context to do the projection */
+		if (mtstate->ps.ps_ExprContext == NULL)
+			ExecAssignExprContext(estate, &mtstate->ps);
+
+		resultRelInfo->ri_projectNew =
+			ExecBuildProjectionInfo(insertTargetList,
+									mtstate->ps.ps_ExprContext,
+									resultRelInfo->ri_newTupleSlot,
+									&mtstate->ps,
+									relDesc);
+	}
+
+	resultRelInfo->ri_projectNewInfoValid = true;
+}
+
+/*
+ * ExecInitUpdateProjection
+ *		Do one-time initialization of projection data for UPDATE tuples.
+ *
+ * UPDATE always needs a projection, because (1) there's always some junk
+ * attrs, and (2) we may need to merge values of not-updated columns from
+ * the old tuple into the final tuple.  In UPDATE, the tuple arriving from
+ * the subplan contains only new values for the changed columns, plus row
+ * identity info in the junk attrs.
+ *
+ * This is "one-time" for any given result rel, but we might touch more than
+ * one result rel in the course of a partitioned UPDATE, and each one needs
+ * its own projection due to possible column order variation.
+ *
+ * This is also a convenient place to verify that the output of an UPDATE
+ * matches the target table (ExecBuildUpdateProjection does that).
+ */
+static void
+ExecInitUpdateProjection(ModifyTableState *mtstate,
+						 ResultRelInfo *resultRelInfo)
+{
+	ModifyTable *node = (ModifyTable *) mtstate->ps.plan;
+	Plan	   *subplan = outerPlan(node);
+	EState	   *estate = mtstate->ps.state;
+	TupleDesc	relDesc = RelationGetDescr(resultRelInfo->ri_RelationDesc);
+	int			whichrel;
+	List	   *updateColnos;
+
+	/*
+	 * Usually, mt_lastResultIndex matches the target rel.  If it happens not
+	 * to, we can get the index the hard way with an integer division.
+	 */
+	whichrel = mtstate->mt_lastResultIndex;
+	if (resultRelInfo != mtstate->resultRelInfo + whichrel)
+	{
+		whichrel = resultRelInfo - mtstate->resultRelInfo;
+		Assert(whichrel >= 0 && whichrel < mtstate->mt_nrels);
+	}
+
+	updateColnos = (List *) list_nth(node->updateColnosLists, whichrel);
+
+	/*
+	 * For UPDATE, we use the old tuple to fill up missing values in the tuple
+	 * produced by the subplan to get the new tuple.  We need two slots, both
+	 * matching the table's desired format.
+	 */
+	resultRelInfo->ri_oldTupleSlot =
+		table_slot_create(resultRelInfo->ri_RelationDesc,
+						  &estate->es_tupleTable);
+	resultRelInfo->ri_newTupleSlot =
+		table_slot_create(resultRelInfo->ri_RelationDesc,
+						  &estate->es_tupleTable);
+
+	/* need an expression context to do the projection */
+	if (mtstate->ps.ps_ExprContext == NULL)
+		ExecAssignExprContext(estate, &mtstate->ps);
+
+	resultRelInfo->ri_projectNew =
+		ExecBuildUpdateProjection(subplan->targetlist,
+								  updateColnos,
+								  relDesc,
+								  mtstate->ps.ps_ExprContext,
+								  resultRelInfo->ri_newTupleSlot,
+								  &mtstate->ps);
+
+	resultRelInfo->ri_projectNewInfoValid = true;
+}
+
+/*
  * ExecGetInsertNewTuple
  *		This prepares a "new" tuple ready to be inserted into given result
  *		relation, by removing any junk columns of the plan's output tuple
@@ -429,6 +562,8 @@ ExecGetUpdateNewTuple(ResultRelInfo *relinfo,
 	ProjectionInfo *newProj = relinfo->ri_projectNew;
 	ExprContext *econtext;
 
+	/* Use a few extra Asserts to protect against outside callers */
+	Assert(relinfo->ri_projectNewInfoValid);
 	Assert(planSlot != NULL && !TTS_EMPTY(planSlot));
 	Assert(oldSlot != NULL && !TTS_EMPTY(oldSlot));
 
@@ -491,6 +626,14 @@ ExecInsert(ModifyTableState *mtstate,
 	ExecMaterializeSlot(slot);
 
 	resultRelationDesc = resultRelInfo->ri_RelationDesc;
+
+	/*
+	 * Open the table's indexes, if we have not done so already, so that we
+	 * can add new index entries for the inserted tuple.
+	 */
+	if (resultRelationDesc->rd_rel->relhasindex &&
+		resultRelInfo->ri_IndexRelationDescs == NULL)
+		ExecOpenIndices(resultRelInfo, onconflict != ONCONFLICT_NONE);
 
 	/*
 	 * BEFORE ROW INSERT Triggers.
@@ -1276,7 +1419,6 @@ ExecCrossPartitionUpdate(ModifyTableState *mtstate,
 						 TupleTableSlot **inserted_tuple)
 {
 	EState	   *estate = mtstate->ps.state;
-	PartitionTupleRouting *proute = mtstate->mt_partition_tuple_routing;
 	TupleConversionMap *tupconv_map;
 	bool		tuple_deleted;
 	TupleTableSlot *epqslot = NULL;
@@ -1296,12 +1438,34 @@ ExecCrossPartitionUpdate(ModifyTableState *mtstate,
 				 errdetail("The result tuple would appear in a different partition than the original tuple.")));
 
 	/*
-	 * When an UPDATE is run on a leaf partition, we will not have partition
-	 * tuple routing set up.  In that case, fail with partition constraint
-	 * violation error.
+	 * When an UPDATE is run directly on a leaf partition, simply fail with a
+	 * partition constraint violation error.
 	 */
-	if (proute == NULL)
+	if (resultRelInfo == mtstate->rootResultRelInfo)
 		ExecPartitionCheckEmitError(resultRelInfo, slot, estate);
+
+	/* Initialize tuple routing info if not already done. */
+	if (mtstate->mt_partition_tuple_routing == NULL)
+	{
+		Relation	rootRel = mtstate->rootResultRelInfo->ri_RelationDesc;
+		MemoryContext oldcxt;
+
+		/* Things built here have to last for the query duration. */
+		oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
+
+		mtstate->mt_partition_tuple_routing =
+			ExecSetupPartitionTupleRouting(estate, rootRel);
+
+		/*
+		 * Before a partition's tuple can be re-routed, it must first be
+		 * converted to the root's format, so we'll need a slot for storing
+		 * such tuples.
+		 */
+		Assert(mtstate->mt_root_tuple_slot == NULL);
+		mtstate->mt_root_tuple_slot = table_slot_create(rootRel, NULL);
+
+		MemoryContextSwitchTo(oldcxt);
+	}
 
 	/*
 	 * Row movement, part 1.  Delete the tuple, but skip RETURNING processing.
@@ -1346,8 +1510,12 @@ ExecCrossPartitionUpdate(ModifyTableState *mtstate,
 		else
 		{
 			/* Fetch the most recent version of old tuple. */
-			TupleTableSlot *oldSlot = resultRelInfo->ri_oldTupleSlot;
+			TupleTableSlot *oldSlot;
 
+			/* ... but first, make sure ri_oldTupleSlot is initialized. */
+			if (unlikely(!resultRelInfo->ri_projectNewInfoValid))
+				ExecInitUpdateProjection(mtstate, resultRelInfo);
+			oldSlot = resultRelInfo->ri_oldTupleSlot;
 			if (!table_tuple_fetch_row_version(resultRelInfo->ri_RelationDesc,
 											   tupleid,
 											   SnapshotAny,
@@ -1364,7 +1532,7 @@ ExecCrossPartitionUpdate(ModifyTableState *mtstate,
 	 * convert the tuple into root's tuple descriptor if needed, since
 	 * ExecInsert() starts the search from root.
 	 */
-	tupconv_map = resultRelInfo->ri_ChildToRootMap;
+	tupconv_map = ExecGetChildToRootMap(resultRelInfo);
 	if (tupconv_map != NULL)
 		slot = execute_attr_map_slot(tupconv_map->attrMap,
 									 slot,
@@ -1435,6 +1603,14 @@ ExecUpdate(ModifyTableState *mtstate,
 		elog(ERROR, "cannot UPDATE during bootstrap");
 
 	ExecMaterializeSlot(slot);
+
+	/*
+	 * Open the table's indexes, if we have not done so already, so that we
+	 * can add new index entries for the updated tuple.
+	 */
+	if (resultRelationDesc->rd_rel->relhasindex &&
+		resultRelInfo->ri_IndexRelationDescs == NULL)
+		ExecOpenIndices(resultRelInfo, false);
 
 	/* BEFORE ROW UPDATE Triggers */
 	if (resultRelInfo->ri_TrigDesc &&
@@ -1668,6 +1844,10 @@ lreplace:;
 							if (TupIsNull(epqslot))
 								/* Tuple not passing quals anymore, exiting... */
 								return NULL;
+
+							/* Make sure ri_oldTupleSlot is initialized. */
+							if (unlikely(!resultRelInfo->ri_projectNewInfoValid))
+								ExecInitUpdateProjection(mtstate, resultRelInfo);
 
 							/* Fetch the most recent version of old tuple. */
 							oldSlot = resultRelInfo->ri_oldTupleSlot;
@@ -2244,38 +2424,8 @@ ExecModifyTable(PlanState *pstate)
 
 			/* If it's not the same as last time, we need to locate the rel */
 			if (resultoid != node->mt_lastResultOid)
-			{
-				if (node->mt_resultOidHash)
-				{
-					/* Use the pre-built hash table to locate the rel */
-					MTTargetRelLookup *mtlookup;
-
-					mtlookup = (MTTargetRelLookup *)
-						hash_search(node->mt_resultOidHash, &resultoid,
-									HASH_FIND, NULL);
-					if (!mtlookup)
-						elog(ERROR, "incorrect result rel OID %u", resultoid);
-					node->mt_lastResultOid = resultoid;
-					node->mt_lastResultIndex = mtlookup->relationIndex;
-					resultRelInfo = node->resultRelInfo + mtlookup->relationIndex;
-				}
-				else
-				{
-					/* With few target rels, just do a simple search */
-					int			ndx;
-
-					for (ndx = 0; ndx < node->mt_nrels; ndx++)
-					{
-						resultRelInfo = node->resultRelInfo + ndx;
-						if (RelationGetRelid(resultRelInfo->ri_RelationDesc) == resultoid)
-							break;
-					}
-					if (ndx >= node->mt_nrels)
-						elog(ERROR, "incorrect result rel OID %u", resultoid);
-					node->mt_lastResultOid = resultoid;
-					node->mt_lastResultIndex = ndx;
-				}
-			}
+				resultRelInfo = ExecLookupResultRelByOid(node, resultoid,
+														 false, true);
 		}
 
 		/*
@@ -2381,11 +2531,17 @@ ExecModifyTable(PlanState *pstate)
 		switch (operation)
 		{
 			case CMD_INSERT:
+				/* Initialize projection info if first time for this table */
+				if (unlikely(!resultRelInfo->ri_projectNewInfoValid))
+					ExecInitInsertProjection(node, resultRelInfo);
 				slot = ExecGetInsertNewTuple(resultRelInfo, planSlot);
 				slot = ExecInsert(node, resultRelInfo, slot, planSlot,
 								  estate, node->canSetTag);
 				break;
 			case CMD_UPDATE:
+				/* Initialize projection info if first time for this table */
+				if (unlikely(!resultRelInfo->ri_projectNewInfoValid))
+					ExecInitUpdateProjection(node, resultRelInfo);
 
 				/*
 				 * Make the new tuple by combining plan's output tuple with
@@ -2466,6 +2622,61 @@ ExecModifyTable(PlanState *pstate)
 	return NULL;
 }
 
+/*
+ * ExecLookupResultRelByOid
+ * 		If the table with given OID is among the result relations to be
+ * 		updated by the given ModifyTable node, return its ResultRelInfo.
+ *
+ * If not found, return NULL if missing_ok, else raise error.
+ *
+ * If update_cache is true, then upon successful lookup, update the node's
+ * one-element cache.  ONLY ExecModifyTable may pass true for this.
+ */
+ResultRelInfo *
+ExecLookupResultRelByOid(ModifyTableState *node, Oid resultoid,
+						 bool missing_ok, bool update_cache)
+{
+	if (node->mt_resultOidHash)
+	{
+		/* Use the pre-built hash table to locate the rel */
+		MTTargetRelLookup *mtlookup;
+
+		mtlookup = (MTTargetRelLookup *)
+			hash_search(node->mt_resultOidHash, &resultoid, HASH_FIND, NULL);
+		if (mtlookup)
+		{
+			if (update_cache)
+			{
+				node->mt_lastResultOid = resultoid;
+				node->mt_lastResultIndex = mtlookup->relationIndex;
+			}
+			return node->resultRelInfo + mtlookup->relationIndex;
+		}
+	}
+	else
+	{
+		/* With few target rels, just search the ResultRelInfo array */
+		for (int ndx = 0; ndx < node->mt_nrels; ndx++)
+		{
+			ResultRelInfo *rInfo = node->resultRelInfo + ndx;
+
+			if (RelationGetRelid(rInfo->ri_RelationDesc) == resultoid)
+			{
+				if (update_cache)
+				{
+					node->mt_lastResultOid = resultoid;
+					node->mt_lastResultIndex = ndx;
+				}
+				return rInfo;
+			}
+		}
+	}
+
+	if (!missing_ok)
+		elog(ERROR, "incorrect result relation OID %u", resultoid);
+	return NULL;
+}
+
 /* ----------------------------------------------------------------
  *		ExecInitModifyTable
  * ----------------------------------------------------------------
@@ -2482,7 +2693,6 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	ListCell   *l;
 	int			i;
 	Relation	rel;
-	bool		update_tuple_routing_needed = node->partColsUpdated;
 
 	/* check for unsupported flags */
 	Assert(!(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)));
@@ -2554,7 +2764,17 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		Index		resultRelation = lfirst_int(l);
 
 		if (resultRelInfo != mtstate->rootResultRelInfo)
+		{
 			ExecInitResultRelation(estate, resultRelInfo, resultRelation);
+
+			/*
+			 * For child result relations, store the root result relation
+			 * pointer.  We do so for the convenience of places that want to
+			 * look at the query's original target relation but don't have the
+			 * mtstate handy.
+			 */
+			resultRelInfo->ri_RootResultRelInfo = mtstate->rootResultRelInfo;
+		}
 
 		/* Initialize the usesFdwDirectModify flag */
 		resultRelInfo->ri_usesFdwDirectModify = bms_is_member(i,
@@ -2581,32 +2801,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	{
 		resultRelInfo = &mtstate->resultRelInfo[i];
 
-		/*
-		 * If there are indices on the result relation, open them and save
-		 * descriptors in the result relation info, so that we can add new
-		 * index entries for the tuples we add/update.  We need not do this
-		 * for a DELETE, however, since deletion doesn't affect indexes. Also,
-		 * inside an EvalPlanQual operation, the indexes might be open
-		 * already, since we share the resultrel state with the original
-		 * query.
-		 */
-		if (resultRelInfo->ri_RelationDesc->rd_rel->relhasindex &&
-			operation != CMD_DELETE &&
-			resultRelInfo->ri_IndexRelationDescs == NULL)
-			ExecOpenIndices(resultRelInfo,
-							node->onConflictAction != ONCONFLICT_NONE);
-
-		/*
-		 * If this is an UPDATE and a BEFORE UPDATE trigger is present, the
-		 * trigger itself might modify the partition-key values. So arrange
-		 * for tuple routing.
-		 */
-		if (resultRelInfo->ri_TrigDesc &&
-			resultRelInfo->ri_TrigDesc->trig_update_before_row &&
-			operation == CMD_UPDATE)
-			update_tuple_routing_needed = true;
-
-		/* Also let FDWs init themselves for foreign-table result rels */
+		/* Let FDWs init themselves for foreign-table result rels */
 		if (!resultRelInfo->ri_usesFdwDirectModify &&
 			resultRelInfo->ri_FdwRoutine != NULL &&
 			resultRelInfo->ri_FdwRoutine->BeginForeignModify != NULL)
@@ -2621,50 +2816,75 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		}
 
 		/*
-		 * If needed, initialize a map to convert tuples in the child format
-		 * to the format of the table mentioned in the query (root relation).
-		 * It's needed for update tuple routing, because the routing starts
-		 * from the root relation.  It's also needed for capturing transition
-		 * tuples, because the transition tuple store can only store tuples in
-		 * the root table format.
-		 *
-		 * For INSERT, the map is only initialized for a given partition when
-		 * the partition itself is first initialized by ExecFindPartition().
+		 * For UPDATE/DELETE, find the appropriate junk attr now, either a
+		 * 'ctid' or 'wholerow' attribute depending on relkind.  For foreign
+		 * tables, the FDW might have created additional junk attr(s), but
+		 * those are no concern of ours.
 		 */
-		if (update_tuple_routing_needed ||
-			(mtstate->mt_transition_capture &&
-			 mtstate->operation != CMD_INSERT))
-			resultRelInfo->ri_ChildToRootMap =
-				convert_tuples_by_name(RelationGetDescr(resultRelInfo->ri_RelationDesc),
-									   RelationGetDescr(mtstate->rootResultRelInfo->ri_RelationDesc));
+		if (operation == CMD_UPDATE || operation == CMD_DELETE)
+		{
+			char		relkind;
+
+			relkind = resultRelInfo->ri_RelationDesc->rd_rel->relkind;
+			if (relkind == RELKIND_RELATION ||
+				relkind == RELKIND_MATVIEW ||
+				relkind == RELKIND_PARTITIONED_TABLE)
+			{
+				resultRelInfo->ri_RowIdAttNo =
+					ExecFindJunkAttributeInTlist(subplan->targetlist, "ctid");
+				if (!AttributeNumberIsValid(resultRelInfo->ri_RowIdAttNo))
+					elog(ERROR, "could not find junk ctid column");
+			}
+			else if (relkind == RELKIND_FOREIGN_TABLE)
+			{
+				/*
+				 * When there is a row-level trigger, there should be a
+				 * wholerow attribute.  We also require it to be present in
+				 * UPDATE, so we can get the values of unchanged columns.
+				 */
+				resultRelInfo->ri_RowIdAttNo =
+					ExecFindJunkAttributeInTlist(subplan->targetlist,
+												 "wholerow");
+				if (mtstate->operation == CMD_UPDATE &&
+					!AttributeNumberIsValid(resultRelInfo->ri_RowIdAttNo))
+					elog(ERROR, "could not find junk wholerow column");
+			}
+			else
+			{
+				/* Other valid target relkinds must provide wholerow */
+				resultRelInfo->ri_RowIdAttNo =
+					ExecFindJunkAttributeInTlist(subplan->targetlist,
+												 "wholerow");
+				if (!AttributeNumberIsValid(resultRelInfo->ri_RowIdAttNo))
+					elog(ERROR, "could not find junk wholerow column");
+			}
+		}
 	}
+
+	/*
+	 * If this is an inherited update/delete, there will be a junk attribute
+	 * named "tableoid" present in the subplan's targetlist.  It will be used
+	 * to identify the result relation for a given tuple to be
+	 * updated/deleted.
+	 */
+	mtstate->mt_resultOidAttno =
+		ExecFindJunkAttributeInTlist(subplan->targetlist, "tableoid");
+	Assert(AttributeNumberIsValid(mtstate->mt_resultOidAttno) || nrels == 1);
+	mtstate->mt_lastResultOid = InvalidOid; /* force lookup at first tuple */
+	mtstate->mt_lastResultIndex = 0;	/* must be zero if no such attr */
 
 	/* Get the root target relation */
 	rel = mtstate->rootResultRelInfo->ri_RelationDesc;
 
 	/*
-	 * If it's not a partitioned table after all, UPDATE tuple routing should
-	 * not be attempted.
-	 */
-	if (rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
-		update_tuple_routing_needed = false;
-
-	/*
-	 * Build state for tuple routing if it's an INSERT or if it's an UPDATE of
-	 * partition key.
+	 * Build state for tuple routing if it's a partitioned INSERT.  An UPDATE
+	 * might need this too, but only if it actually moves tuples between
+	 * partitions; in that case setup is done by ExecCrossPartitionUpdate.
 	 */
 	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE &&
-		(operation == CMD_INSERT || update_tuple_routing_needed))
+		operation == CMD_INSERT)
 		mtstate->mt_partition_tuple_routing =
-			ExecSetupPartitionTupleRouting(estate, mtstate, rel);
-
-	/*
-	 * For update row movement we'll need a dedicated slot to store the tuples
-	 * that have been converted from partition format to the root table
-	 * format.
-	 */
-	if (update_tuple_routing_needed)
-		mtstate->mt_root_tuple_slot = table_slot_create(rel, NULL);
+			ExecSetupPartitionTupleRouting(estate, rel);
 
 	/*
 	 * Initialize any WITH CHECK OPTION constraints if needed.
@@ -2743,7 +2963,11 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	/* Set the list of arbiter indexes if needed for ON CONFLICT */
 	resultRelInfo = mtstate->resultRelInfo;
 	if (node->onConflictAction != ONCONFLICT_NONE)
+	{
+		/* insert may only have one relation, inheritance is not expanded */
+		Assert(nrels == 1);
 		resultRelInfo->ri_onConflictArbiterIndexes = node->arbiterIndexes;
+	}
 
 	/*
 	 * If needed, Initialize target list, projection and qual for ON CONFLICT
@@ -2754,9 +2978,6 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		ExprContext *econtext;
 		TupleDesc	relationDesc;
 		TupleDesc	tupDesc;
-
-		/* insert may only have one relation, inheritance is not expanded */
-		Assert(nrels == 1);
 
 		/* already exists if created by RETURNING processing above */
 		if (mtstate->ps.ps_ExprContext == NULL)
@@ -2828,163 +3049,6 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	EvalPlanQualSetPlan(&mtstate->mt_epqstate, subplan, arowmarks);
 
 	/*
-	 * Initialize projection(s) to create tuples suitable for result rel(s).
-	 * INSERT queries may need a projection to filter out junk attrs in the
-	 * tlist.  UPDATE always needs a projection, because (1) there's always
-	 * some junk attrs, and (2) we may need to merge values of not-updated
-	 * columns from the old tuple into the final tuple.  In UPDATE, the tuple
-	 * arriving from the subplan contains only new values for the changed
-	 * columns, plus row identity info in the junk attrs.
-	 *
-	 * If there are multiple result relations, each one needs its own
-	 * projection.  Note multiple rels are only possible for UPDATE/DELETE, so
-	 * we can't be fooled by some needing a projection and some not.
-	 *
-	 * This section of code is also a convenient place to verify that the
-	 * output of an INSERT or UPDATE matches the target table(s).
-	 */
-	for (i = 0; i < nrels; i++)
-	{
-		resultRelInfo = &mtstate->resultRelInfo[i];
-
-		/*
-		 * Prepare to generate tuples suitable for the target relation.
-		 */
-		if (operation == CMD_INSERT)
-		{
-			List	   *insertTargetList = NIL;
-			bool		need_projection = false;
-
-			foreach(l, subplan->targetlist)
-			{
-				TargetEntry *tle = (TargetEntry *) lfirst(l);
-
-				if (!tle->resjunk)
-					insertTargetList = lappend(insertTargetList, tle);
-				else
-					need_projection = true;
-			}
-
-			/*
-			 * The junk-free list must produce a tuple suitable for the result
-			 * relation.
-			 */
-			ExecCheckPlanOutput(resultRelInfo->ri_RelationDesc,
-								insertTargetList);
-
-			/* We'll need a slot matching the table's format. */
-			resultRelInfo->ri_newTupleSlot =
-				table_slot_create(resultRelInfo->ri_RelationDesc,
-								  &mtstate->ps.state->es_tupleTable);
-
-			/* Build ProjectionInfo if needed (it probably isn't). */
-			if (need_projection)
-			{
-				TupleDesc	relDesc = RelationGetDescr(resultRelInfo->ri_RelationDesc);
-
-				/* need an expression context to do the projection */
-				if (mtstate->ps.ps_ExprContext == NULL)
-					ExecAssignExprContext(estate, &mtstate->ps);
-
-				resultRelInfo->ri_projectNew =
-					ExecBuildProjectionInfo(insertTargetList,
-											mtstate->ps.ps_ExprContext,
-											resultRelInfo->ri_newTupleSlot,
-											&mtstate->ps,
-											relDesc);
-			}
-		}
-		else if (operation == CMD_UPDATE)
-		{
-			List	   *updateColnos;
-			TupleDesc	relDesc = RelationGetDescr(resultRelInfo->ri_RelationDesc);
-
-			updateColnos = (List *) list_nth(node->updateColnosLists, i);
-
-			/*
-			 * For UPDATE, we use the old tuple to fill up missing values in
-			 * the tuple produced by the plan to get the new tuple.  We need
-			 * two slots, both matching the table's desired format.
-			 */
-			resultRelInfo->ri_oldTupleSlot =
-				table_slot_create(resultRelInfo->ri_RelationDesc,
-								  &mtstate->ps.state->es_tupleTable);
-			resultRelInfo->ri_newTupleSlot =
-				table_slot_create(resultRelInfo->ri_RelationDesc,
-								  &mtstate->ps.state->es_tupleTable);
-
-			/* need an expression context to do the projection */
-			if (mtstate->ps.ps_ExprContext == NULL)
-				ExecAssignExprContext(estate, &mtstate->ps);
-
-			resultRelInfo->ri_projectNew =
-				ExecBuildUpdateProjection(subplan->targetlist,
-										  updateColnos,
-										  relDesc,
-										  mtstate->ps.ps_ExprContext,
-										  resultRelInfo->ri_newTupleSlot,
-										  &mtstate->ps);
-		}
-
-		/*
-		 * For UPDATE/DELETE, find the appropriate junk attr now, either a
-		 * 'ctid' or 'wholerow' attribute depending on relkind.  For foreign
-		 * tables, the FDW might have created additional junk attr(s), but
-		 * those are no concern of ours.
-		 */
-		if (operation == CMD_UPDATE || operation == CMD_DELETE)
-		{
-			char		relkind;
-
-			relkind = resultRelInfo->ri_RelationDesc->rd_rel->relkind;
-			if (relkind == RELKIND_RELATION ||
-				relkind == RELKIND_MATVIEW ||
-				relkind == RELKIND_PARTITIONED_TABLE)
-			{
-				resultRelInfo->ri_RowIdAttNo =
-					ExecFindJunkAttributeInTlist(subplan->targetlist, "ctid");
-				if (!AttributeNumberIsValid(resultRelInfo->ri_RowIdAttNo))
-					elog(ERROR, "could not find junk ctid column");
-			}
-			else if (relkind == RELKIND_FOREIGN_TABLE)
-			{
-				/*
-				 * When there is a row-level trigger, there should be a
-				 * wholerow attribute.  We also require it to be present in
-				 * UPDATE, so we can get the values of unchanged columns.
-				 */
-				resultRelInfo->ri_RowIdAttNo =
-					ExecFindJunkAttributeInTlist(subplan->targetlist,
-												 "wholerow");
-				if (mtstate->operation == CMD_UPDATE &&
-					!AttributeNumberIsValid(resultRelInfo->ri_RowIdAttNo))
-					elog(ERROR, "could not find junk wholerow column");
-			}
-			else
-			{
-				/* Other valid target relkinds must provide wholerow */
-				resultRelInfo->ri_RowIdAttNo =
-					ExecFindJunkAttributeInTlist(subplan->targetlist,
-												 "wholerow");
-				if (!AttributeNumberIsValid(resultRelInfo->ri_RowIdAttNo))
-					elog(ERROR, "could not find junk wholerow column");
-			}
-		}
-	}
-
-	/*
-	 * If this is an inherited update/delete, there will be a junk attribute
-	 * named "tableoid" present in the subplan's targetlist.  It will be used
-	 * to identify the result relation for a given tuple to be
-	 * updated/deleted.
-	 */
-	mtstate->mt_resultOidAttno =
-		ExecFindJunkAttributeInTlist(subplan->targetlist, "tableoid");
-	Assert(AttributeNumberIsValid(mtstate->mt_resultOidAttno) || nrels == 1);
-	mtstate->mt_lastResultOid = InvalidOid; /* force lookup at first tuple */
-	mtstate->mt_lastResultIndex = 0;	/* must be zero if no such attr */
-
-	/*
 	 * If there are a lot of result relations, use a hash table to speed the
 	 * lookups.  If there are not a lot, a simple linear search is faster.
 	 *
@@ -3036,22 +3100,20 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	 */
 	if (operation == CMD_INSERT)
 	{
+		/* insert may only have one relation, inheritance is not expanded */
+		Assert(nrels == 1);
 		resultRelInfo = mtstate->resultRelInfo;
-		for (i = 0; i < nrels; i++)
+		if (!resultRelInfo->ri_usesFdwDirectModify &&
+			resultRelInfo->ri_FdwRoutine != NULL &&
+			resultRelInfo->ri_FdwRoutine->GetForeignModifyBatchSize &&
+			resultRelInfo->ri_FdwRoutine->ExecForeignBatchInsert)
 		{
-			if (!resultRelInfo->ri_usesFdwDirectModify &&
-				resultRelInfo->ri_FdwRoutine != NULL &&
-				resultRelInfo->ri_FdwRoutine->GetForeignModifyBatchSize &&
-				resultRelInfo->ri_FdwRoutine->ExecForeignBatchInsert)
-				resultRelInfo->ri_BatchSize =
-					resultRelInfo->ri_FdwRoutine->GetForeignModifyBatchSize(resultRelInfo);
-			else
-				resultRelInfo->ri_BatchSize = 1;
-
+			resultRelInfo->ri_BatchSize =
+				resultRelInfo->ri_FdwRoutine->GetForeignModifyBatchSize(resultRelInfo);
 			Assert(resultRelInfo->ri_BatchSize >= 1);
-
-			resultRelInfo++;
 		}
+		else
+			resultRelInfo->ri_BatchSize = 1;
 	}
 
 	/*
