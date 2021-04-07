@@ -534,6 +534,7 @@ extern const struct config_enum_entry dynamic_shared_memory_options[];
 /*
  * GUC option variables that are exported from this module
  */
+bool		compute_query_id = false;
 bool		log_duration = false;
 bool		Debug_print_plan = false;
 bool		Debug_print_parse = false;
@@ -1456,6 +1457,15 @@ static struct config_bool ConfigureNamesBool[] =
 		},
 		&Debug_pretty_print,
 		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"compute_query_id", PGC_SUSET, STATS_MONITORING,
+			gettext_noop("Compute query identifiers."),
+			NULL
+		},
+		&compute_query_id,
+		false,
 		NULL, NULL, NULL
 	},
 	{
@@ -2647,6 +2657,24 @@ static struct config_int ConfigureNamesInt[] =
 		0, 0, 1000000,		/* see ComputeXidHorizons */
 		NULL, NULL, NULL
 	},
+	{
+		{"vacuum_failsafe_age", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Age at which VACUUM should trigger failsafe to avoid a wraparound outage."),
+			NULL
+		},
+		&vacuum_failsafe_age,
+		1600000000, 0, 2100000000,
+		NULL, NULL, NULL
+	},
+	{
+		{"vacuum_multixact_failsafe_age", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Multixact age at which VACUUM should trigger failsafe to avoid a wraparound outage."),
+			NULL
+		},
+		&vacuum_multixact_failsafe_age,
+		1600000000, 0, 2100000000,
+		NULL, NULL, NULL
+	},
 
 	/*
 	 * See also CheckRequiredParameterValues() if this parameter changes
@@ -3247,7 +3275,10 @@ static struct config_int ConfigureNamesInt[] =
 			NULL
 		},
 		&autovacuum_freeze_max_age,
-		/* see pg_resetwal if you change the upper-limit value */
+		/*
+		 * see pg_resetwal and vacuum_failsafe_age if you change the
+		 * upper-limit value.
+		 */
 		200000000, 100000, 2000000000,
 		NULL, NULL, NULL
 	},
@@ -5335,6 +5366,45 @@ add_guc_variable(struct config_generic *var, int elevel)
 }
 
 /*
+ * Decide whether a proposed custom variable name is allowed.
+ *
+ * It must be "identifier.identifier", where the rules for what is an
+ * identifier agree with scan.l.
+ */
+static bool
+valid_custom_variable_name(const char *name)
+{
+	int			num_sep = 0;
+	bool		name_start = true;
+
+	for (const char *p = name; *p; p++)
+	{
+		if (*p == GUC_QUALIFIER_SEPARATOR)
+		{
+			if (name_start)
+				return false;	/* empty name component */
+			num_sep++;
+			name_start = true;
+		}
+		else if (strchr("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+						"abcdefghijklmnopqrstuvwxyz", *p) != NULL ||
+				 IS_HIGHBIT_SET(*p))
+		{
+			/* okay as first or non-first character */
+			name_start = false;
+		}
+		else if (!name_start && strchr("0123456789_$", *p) != NULL)
+			 /* okay as non-first character */ ;
+		else
+			return false;
+	}
+	if (name_start)
+		return false;			/* empty name component */
+	/* OK if we had exactly one separator */
+	return (num_sep == 1);
+}
+
+/*
  * Create and add a placeholder variable for a custom variable name.
  */
 static struct config_generic *
@@ -5381,12 +5451,23 @@ add_placeholder_variable(const char *name, int elevel)
 }
 
 /*
- * Look up option NAME.  If it exists, return a pointer to its record,
- * else return NULL.  If create_placeholders is true, we'll create a
- * placeholder record for a valid-looking custom variable name.
+ * Look up option "name".  If it exists, return a pointer to its record.
+ * Otherwise, if create_placeholders is true and name is a valid-looking
+ * custom variable name, we'll create and return a placeholder record.
+ * Otherwise, if skip_errors is true, then we silently return NULL for
+ * an unrecognized or invalid name.  Otherwise, the error is reported at
+ * error level elevel (and we return NULL if that's less than ERROR).
+ *
+ * Note: internal errors, primarily out-of-memory, draw an elevel-level
+ * report and NULL return regardless of skip_errors.  Hence, callers must
+ * handle a NULL return whenever elevel < ERROR, but they should not need
+ * to emit any additional error message.  (In practice, internal errors
+ * can only happen when create_placeholders is true, so callers passing
+ * false need not think terribly hard about this.)
  */
 static struct config_generic *
-find_option(const char *name, bool create_placeholders, int elevel)
+find_option(const char *name, bool create_placeholders, bool skip_errors,
+			int elevel)
 {
 	const char **key = &name;
 	struct config_generic **res;
@@ -5414,19 +5495,38 @@ find_option(const char *name, bool create_placeholders, int elevel)
 	for (i = 0; map_old_guc_names[i] != NULL; i += 2)
 	{
 		if (guc_name_compare(name, map_old_guc_names[i]) == 0)
-			return find_option(map_old_guc_names[i + 1], false, elevel);
+			return find_option(map_old_guc_names[i + 1], false,
+							   skip_errors, elevel);
 	}
 
 	if (create_placeholders)
 	{
 		/*
-		 * Check if the name is qualified, and if so, add a placeholder.
+		 * Check if the name is valid, and if so, add a placeholder.  If it
+		 * doesn't contain a separator, don't assume that it was meant to be a
+		 * placeholder.
 		 */
 		if (strchr(name, GUC_QUALIFIER_SEPARATOR) != NULL)
-			return add_placeholder_variable(name, elevel);
+		{
+			if (valid_custom_variable_name(name))
+				return add_placeholder_variable(name, elevel);
+			/* A special error message seems desirable here */
+			if (!skip_errors)
+				ereport(elevel,
+						(errcode(ERRCODE_INVALID_NAME),
+						 errmsg("invalid configuration parameter name \"%s\"",
+								name),
+						 errdetail("Custom parameter names must be of the form \"identifier.identifier\".")));
+			return NULL;
+		}
 	}
 
 	/* Unknown name */
+	if (!skip_errors)
+		ereport(elevel,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("unrecognized configuration parameter \"%s\"",
+						name)));
 	return NULL;
 }
 
@@ -6444,7 +6544,7 @@ ReportChangedGUCOptions(void)
 	{
 		struct config_generic *record;
 
-		record = find_option("in_hot_standby", false, ERROR);
+		record = find_option("in_hot_standby", false, false, ERROR);
 		Assert(record != NULL);
 		record->status |= GUC_NEEDS_REPORT;
 		report_needed = true;
@@ -7218,14 +7318,9 @@ set_config_option(const char *name, const char *value,
 				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
 				 errmsg("cannot set parameters during a parallel operation")));
 
-	record = find_option(name, true, elevel);
+	record = find_option(name, true, false, elevel);
 	if (record == NULL)
-	{
-		ereport(elevel,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("unrecognized configuration parameter \"%s\"", name)));
 		return 0;
-	}
 
 	/*
 	 * Check if the option can be set at this time. See guc.h for the precise
@@ -7947,10 +8042,10 @@ set_config_sourcefile(const char *name, char *sourcefile, int sourceline)
 	 */
 	elevel = IsUnderPostmaster ? DEBUG3 : LOG;
 
-	record = find_option(name, true, elevel);
+	record = find_option(name, true, false, elevel);
 	/* should not happen */
 	if (record == NULL)
-		elog(ERROR, "unrecognized configuration parameter \"%s\"", name);
+		return;
 
 	sourcefile = guc_strdup(elevel, sourcefile);
 	if (record->sourcefile)
@@ -7999,16 +8094,9 @@ GetConfigOption(const char *name, bool missing_ok, bool restrict_privileged)
 	struct config_generic *record;
 	static char buffer[256];
 
-	record = find_option(name, false, ERROR);
+	record = find_option(name, false, missing_ok, ERROR);
 	if (record == NULL)
-	{
-		if (missing_ok)
-			return NULL;
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("unrecognized configuration parameter \"%s\"",
-						name)));
-	}
+		return NULL;
 	if (restrict_privileged &&
 		(record->flags & GUC_SUPERUSER_ONLY) &&
 		!is_member_of_role(GetUserId(), ROLE_PG_READ_ALL_SETTINGS))
@@ -8055,11 +8143,8 @@ GetConfigOptionResetString(const char *name)
 	struct config_generic *record;
 	static char buffer[256];
 
-	record = find_option(name, false, ERROR);
-	if (record == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("unrecognized configuration parameter \"%s\"", name)));
+	record = find_option(name, false, false, ERROR);
+	Assert(record != NULL);
 	if ((record->flags & GUC_SUPERUSER_ONLY) &&
 		!is_member_of_role(GetUserId(), ROLE_PG_READ_ALL_SETTINGS))
 		ereport(ERROR,
@@ -8103,16 +8188,9 @@ GetConfigOptionFlags(const char *name, bool missing_ok)
 {
 	struct config_generic *record;
 
-	record = find_option(name, false, WARNING);
+	record = find_option(name, false, missing_ok, ERROR);
 	if (record == NULL)
-	{
-		if (missing_ok)
-			return 0;
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("unrecognized configuration parameter \"%s\"",
-						name)));
-	}
+		return 0;
 	return record->flags;
 }
 
@@ -8144,7 +8222,7 @@ flatten_set_variable_args(const char *name, List *args)
 	 * Get flags for the variable; if it's not known, use default flags.
 	 * (Caller might throw error later, but not our business to do so here.)
 	 */
-	record = find_option(name, false, WARNING);
+	record = find_option(name, false, true, WARNING);
 	if (record)
 		flags = record->flags;
 	else
@@ -8439,12 +8517,8 @@ AlterSystemSetConfigFile(AlterSystemStmt *altersysstmt)
 	{
 		struct config_generic *record;
 
-		record = find_option(name, false, ERROR);
-		if (record == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("unrecognized configuration parameter \"%s\"",
-							name)));
+		record = find_option(name, false, false, ERROR);
+		Assert(record != NULL);
 
 		/*
 		 * Don't allow parameters that can't be set in configuration files to
@@ -9460,19 +9534,12 @@ GetConfigOptionByName(const char *name, const char **varname, bool missing_ok)
 {
 	struct config_generic *record;
 
-	record = find_option(name, false, ERROR);
+	record = find_option(name, false, missing_ok, ERROR);
 	if (record == NULL)
 	{
-		if (missing_ok)
-		{
-			if (varname)
-				*varname = NULL;
-			return NULL;
-		}
-
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("unrecognized configuration parameter \"%s\"", name)));
+		if (varname)
+			*varname = NULL;
+		return NULL;
 	}
 
 	if ((record->flags & GUC_SUPERUSER_ONLY) &&
@@ -10318,7 +10385,7 @@ read_nondefault_variables(void)
 		if ((varname = read_string_with_null(fp)) == NULL)
 			break;
 
-		if ((record = find_option(varname, true, FATAL)) == NULL)
+		if ((record = find_option(varname, true, false, FATAL)) == NULL)
 			elog(FATAL, "failed to locate variable \"%s\" in exec config params file", varname);
 
 		if ((varvalue = read_string_with_null(fp)) == NULL)
@@ -11008,7 +11075,7 @@ GUCArrayAdd(ArrayType *array, const char *name, const char *value)
 	(void) validate_option_array_item(name, value, false);
 
 	/* normalize name (converts obsolete GUC names to modern spellings) */
-	record = find_option(name, false, WARNING);
+	record = find_option(name, false, true, WARNING);
 	if (record)
 		name = record->name;
 
@@ -11087,7 +11154,7 @@ GUCArrayDelete(ArrayType *array, const char *name)
 	(void) validate_option_array_item(name, NULL, false);
 
 	/* normalize name (converts obsolete GUC names to modern spellings) */
-	record = find_option(name, false, WARNING);
+	record = find_option(name, false, true, WARNING);
 	if (record)
 		name = record->name;
 
@@ -11234,7 +11301,7 @@ validate_option_array_item(const char *name, const char *value,
 	 * SUSET and user is superuser).
 	 *
 	 * name is not known, but exists or can be created as a placeholder (i.e.,
-	 * it has a prefixed name).  We allow this case if you're a superuser,
+	 * it has a valid custom name).  We allow this case if you're a superuser,
 	 * otherwise not.  Superusers are assumed to know what they're doing. We
 	 * can't allow it for other users, because when the placeholder is
 	 * resolved it might turn out to be a SUSET variable;
@@ -11243,16 +11310,11 @@ validate_option_array_item(const char *name, const char *value,
 	 * name is not known and can't be created as a placeholder.  Throw error,
 	 * unless skipIfNoPermissions is true, in which case return false.
 	 */
-	gconf = find_option(name, true, WARNING);
+	gconf = find_option(name, true, skipIfNoPermissions, ERROR);
 	if (!gconf)
 	{
 		/* not known, failed to make a placeholder */
-		if (skipIfNoPermissions)
-			return false;
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("unrecognized configuration parameter \"%s\"",
-						name)));
+		return false;
 	}
 
 	if (gconf->flags & GUC_CUSTOM_PLACEHOLDER)
