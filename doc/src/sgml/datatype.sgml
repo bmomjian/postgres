@@ -2771,14 +2771,12 @@ P <optional> <replaceable>years</replaceable>-<replaceable>months</replaceable>-
 
     <para>
      Field values can have fractional parts; for example <literal>'1.5
-     weeks'</literal> or <literal>'01:02:03.45'</literal>.  Such input
-     is converted to the appropriate number of months, days, and seconds
-     for storage.  If a fractional value is specified, it is used to
-     compute an appropriate value for the next lower-order internal field
-     using the conversion factors 1 month = 30 days and 1 day = 24 hours.
-     For example, <literal>'1.5 months'</literal> becomes <literal>1 month
-     15 days</literal>.  Only seconds will ever be shown as fractional
-     on output.
+     weeks'</literal> or <literal>'01:02:03.45'</literal>.  The fractional
+     parts are used to compute appropriate values for the next lower-order
+     internal fields (months, days, seconds).  For example, <literal>'1.5
+     months'</literal> becomes <literal>1 month 15 days</literal>.
+     The fractional conversion factors used are 1 month = 30 days and 1 day
+     = 24 hours.  Only seconds will ever be shown as fractional on output.
     </para>
 
     <para>
