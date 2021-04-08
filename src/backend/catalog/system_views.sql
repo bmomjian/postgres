@@ -911,6 +911,20 @@ CREATE VIEW pg_stat_wal_receiver AS
     FROM pg_stat_get_wal_receiver() s
     WHERE s.pid IS NOT NULL;
 
+CREATE VIEW pg_stat_prefetch_recovery AS
+    SELECT
+            s.stats_reset,
+            s.prefetch,
+            s.skip_hit,
+            s.skip_new,
+            s.skip_fpw,
+            s.skip_seq,
+            s.distance,
+            s.queue_depth,
+	    s.avg_distance,
+	    s.avg_queue_depth
+     FROM pg_stat_get_prefetch_recovery() s;
+
 CREATE VIEW pg_stat_subscription AS
     SELECT
             su.oid AS subid,
@@ -1345,6 +1359,16 @@ CREATE OR REPLACE FUNCTION pg_stop_backup (
 CREATE OR REPLACE FUNCTION
   pg_promote(wait boolean DEFAULT true, wait_seconds integer DEFAULT 60)
   RETURNS boolean STRICT VOLATILE LANGUAGE INTERNAL AS 'pg_promote'
+  PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION
+  pg_terminate_backend(pid integer, timeout int8 DEFAULT 0)
+  RETURNS boolean STRICT VOLATILE LANGUAGE INTERNAL AS 'pg_terminate_backend'
+  PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION
+  pg_wait_for_backend_termination(pid integer, timeout int8 DEFAULT 5000)
+  RETURNS boolean STRICT VOLATILE LANGUAGE INTERNAL AS 'pg_wait_for_backend_termination'
   PARALLEL SAFE;
 
 -- legacy definition for compatibility with 9.3
