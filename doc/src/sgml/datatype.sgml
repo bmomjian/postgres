@@ -2771,7 +2771,7 @@ P <optional> <replaceable>years</replaceable>-<replaceable>months</replaceable>-
 
     <para>
      Field values can have fractional parts; for example
-     <literal>'1.5 week'</literal> or <literal>'01:02:03.45'</literal>.  Such input is
+     <literal>'1.5 weeks'</literal> or <literal>'01:02:03.45'</literal>.  Such input is
      converted to the appropriate number of months, days, and seconds
      for storage.  If a fractional value is specified, it is used to
      compute an appropriate value for the next lower-order internal field
