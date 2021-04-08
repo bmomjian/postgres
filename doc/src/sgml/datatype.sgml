@@ -2777,7 +2777,7 @@ P <optional> <replaceable>years</replaceable>-<replaceable>months</replaceable>-
      compute an appropriate value for the next lower-order internal field
      using the conversion factors 1 month = 30 days and 1 day = 24 hours.
      For example, <literal>'1.5 month'</literal> becomes <literal>1 month
-     and 15 days</literal>.  Only seconds will ever be shown as fractional
+     15 days</literal>.  Only seconds will ever be shown as fractional
      on output.
     </para>
 
