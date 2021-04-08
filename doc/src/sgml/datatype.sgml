@@ -2770,7 +2770,7 @@ P <optional> <replaceable>years</replaceable>-<replaceable>months</replaceable>-
     </para>
 
     <para>
-     Field values can have fractional parts, e.g., <literal>'1.5
+     Field values can have fractional parts:  for example, <literal>'1.5
      weeks'</literal> or <literal>'01:02:03.45'</literal>.  The fractional
      parts are used to compute appropriate values for the next lower-order
      internal fields (months, days, seconds).  For example, <literal>'1.5
