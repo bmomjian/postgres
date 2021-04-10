@@ -1298,7 +1298,7 @@ static struct config_bool ConfigureNamesBool[] =
 	},
 	{
 		{"recovery_prefetch", PGC_SIGHUP, WAL_SETTINGS,
-			gettext_noop("Prefetch referenced blocks during recovery"),
+			gettext_noop("Prefetch referenced blocks during recovery."),
 			gettext_noop("Read ahead of the current replay position to find uncached blocks.")
 		},
 		&recovery_prefetch,
@@ -1307,7 +1307,7 @@ static struct config_bool ConfigureNamesBool[] =
 	},
 	{
 		{"recovery_prefetch_fpw", PGC_SIGHUP, WAL_SETTINGS,
-			gettext_noop("Prefetch blocks that have full page images in the WAL"),
+			gettext_noop("Prefetch blocks that have full page images in the WAL."),
 			gettext_noop("On some systems, there is no benefit to prefetching pages that will be "
 						 "entirely overwritten, but if the logical page size of the filesystem is "
 						 "larger than PostgreSQL's, this can be beneficial.  This option has no "
@@ -1320,7 +1320,7 @@ static struct config_bool ConfigureNamesBool[] =
 
 	{
 		{"wal_log_hints", PGC_POSTMASTER, WAL_SETTINGS,
-			gettext_noop("Writes full pages to WAL when first modified after a checkpoint, even for a non-critical modifications."),
+			gettext_noop("Writes full pages to WAL when first modified after a checkpoint, even for a non-critical modification."),
 			NULL
 		},
 		&wal_log_hints,
@@ -2774,7 +2774,7 @@ static struct config_int ConfigureNamesInt[] =
 	{
 		{"wal_decode_buffer_size", PGC_POSTMASTER, WAL_ARCHIVE_RECOVERY,
 			gettext_noop("Maximum buffer size for reading ahead in the WAL during recovery."),
-			gettext_noop("This controls the maximum distance we can read ahead n the WAL to prefetch referenced blocks."),
+			gettext_noop("This controls the maximum distance we can read ahead in the WAL to prefetch referenced blocks."),
 			GUC_UNIT_BYTE
 		},
 		&wal_decode_buffer_size,
