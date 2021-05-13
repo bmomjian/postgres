@@ -1586,7 +1586,7 @@ pg_newlocale_from_collation(Oid collid)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("ICU is not supported in this build"), \
-					 errhint("You need to rebuild PostgreSQL using --with-icu.")));
+					 errhint("You need to rebuild PostgreSQL using %s.", "--with-icu")));
 #endif							/* not USE_ICU */
 		}
 
@@ -1668,16 +1668,16 @@ get_collation_actual_version(char collprovider, const char *collcollate)
 	}
 	else
 #endif
-	if (collprovider == COLLPROVIDER_LIBC &&
-		pg_strcasecmp("C", collcollate) != 0 &&
-		pg_strncasecmp("C.", collcollate, 2) != 0 &&
-		pg_strcasecmp("POSIX", collcollate) != 0)
+		if (collprovider == COLLPROVIDER_LIBC &&
+			pg_strcasecmp("C", collcollate) != 0 &&
+			pg_strncasecmp("C.", collcollate, 2) != 0 &&
+			pg_strcasecmp("POSIX", collcollate) != 0)
 	{
 #if defined(__GLIBC__)
 		/* Use the glibc version because we don't have anything better. */
 		collversion = pstrdup(gnu_get_libc_version());
 #elif defined(LC_VERSION_MASK)
-		locale_t    loc;
+		locale_t	loc;
 
 		/* Look up FreeBSD collation version. */
 		loc = newlocale(LC_COLLATE, collcollate, NULL);

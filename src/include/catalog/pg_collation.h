@@ -42,9 +42,9 @@ CATALOG(pg_collation,3456,CollationRelationId)
 	NameData	collcollate;	/* LC_COLLATE setting */
 	NameData	collctype;		/* LC_CTYPE setting */
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
-	text		collversion BKI_DEFAULT(_null_);	/* provider-dependent */
-													/* version of */
-													/* collation data */
+	text		collversion BKI_DEFAULT(_null_);	/* provider-dependent
+													 * version of collation
+													 * data */
 #endif
 } FormData_pg_collation;
 
@@ -55,7 +55,7 @@ CATALOG(pg_collation,3456,CollationRelationId)
  */
 typedef FormData_pg_collation *Form_pg_collation;
 
-DECLARE_TOAST(pg_collation, 8888, 8889);
+DECLARE_TOAST(pg_collation, 6175, 6176);
 
 DECLARE_UNIQUE_INDEX(pg_collation_name_enc_nsp_index, 3164, on pg_collation using btree(collname name_ops, collencoding int4_ops, collnamespace oid_ops));
 #define CollationNameEncNspIndexId 3164
