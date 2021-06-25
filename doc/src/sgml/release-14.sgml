@@ -749,8 +749,8 @@ Author: Alvaro Herrera <alvherre@alvh.no-ip.org>
 -->
 
        <para>
-        Allow vacuum to be more agressive in removing expired rows during
-        certiain index operations (Álvaro Herrera)
+        Allow vacuum to be more aggressive in removing expired rows during
+        certain index operations (Álvaro Herrera)
        </para>
 
        <para>
